@@ -159,7 +159,7 @@ h2{
 p{
     font-size:1.2rem;
     font-weight: 300;
-    line-height: 1.35;
+    line-height: 1.5;
 }
 .wrapper{
     max-width: 800px;
@@ -217,4 +217,8 @@ p{
 
 ul{
     margin-top:0;
+}
+li{
+    line-height: 1.5;
+    font-size: 1.1rem;
 }

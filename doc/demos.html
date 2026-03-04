@@ -16,6 +16,9 @@
         .demos .broken {
             background: red !important;
         }
+        #jinntap-logo{
+            width: 128px;
+        }
     </style>
     <!-- Matomo -->
     <script>
@@ -57,6 +60,7 @@
         </nav>
         <nav class="local-nav" aria-labelledby="Demo Categories">
             <a href="#basic" title="Basic Examples">Basic</a>
+            <a href="#fore" title="fx-fore element Examples">Fore</a>
             <a href="#model" title="Model-related Examples">Model</a>
             <a href="#bind" title="Bind Examples">Bind</a>
             <a href="#instance" title="Instance-related Examples">Instance</a>
@@ -67,7 +71,6 @@
             <a href="#mutation">Data Mutation</a>
             <a href="#functions">Functions</a>
             <a href="#json">JSON</a>
-            <a href="#byelement">by element</a>
             <a href="#bricks">Bricks</a>
             <a href="#other">Other</a>
         </nav>
@@ -95,12 +98,11 @@
 -->
 
         <h2>Featured Demo</h2>
-            <blockquote>This is an example using the new 'Lens' component to inspect all data used in a page. You can inject this component
-            dynamically by appending parameter 'lens' to the URL.</blockquote>
+        <blockquote>This is an example using JinnTap WYSIWYG editor to edit some TEI.</blockquote>
         <figure>
-            <a href="../demo/04-instances.html"><img src="../resources/images/lens.png"></a>
+            <a href="#featured"><img src="../resources/images/jinntap.png" alt="a demo of JinnTap WYSIWYG TEI editor"></a>
             <figcaption>
-                A Fore page with Lens
+                Demo of JinnTap integrating a TEI WYSIWYG editor
             </figcaption>
         </figure>
 
@@ -122,6 +124,24 @@
                 <h3>Ref what?</h3>
                 <p>Introducing binding expressions</p>
             </div></a>
+        </section>
+
+        <h2>fx-fore</h2>
+        <section id="fore" class="three-col">
+            <a href="../demo/beforeunload.html"><div>
+                <h3>Page exit confirmation</h3>
+                <p>Show/do not show a exit confirmation depending on a condition</p>
+            </div></a>
+
+            <a href="../demo/on-event-defer.html"><div>
+                <h3>Defer Fore execution</h3>
+                <p>Wait for an event before running Fore.</p>
+            </div></a>
+            <a href="../demo/on-event.html"><div>
+                <h3><code>init-on</code> and <code>init-on-target</code></h3>
+                <p>All options of <code>init-on</code> on one page.</p>
+            </div></a>
+
         </section>
 
         <h2>Model</h2>
@@ -175,6 +195,10 @@
             <a href="../demo/shared-instances.html"><div>
                 <h3>Shared instances</h3>
                 <p>Instances can be shared between nested Fore elements</p>
+            </div></a>
+            <a href="../demo/create-nodes.html"><div class="updated">
+                <h3>Creating instances</h3>
+                <p>Creating a structured instance in <code>create-nodes</code> mode.</p>
             </div></a>
 
         </section>
@@ -239,19 +263,20 @@
 
         <h2>UI Controls</h2>
         <section id="control" class="three-col">
-            <a href="../demo/fx-control.html"><div><h3>One Control to bind 'em all</h3>
+            <a href="../demo/fx-control.html"><div class="updated"><h3>One Control to bind 'em all</h3>
                 <p>The generic <code>fx-control</code> elements can use native and third-party widgets.</p>
             </div></a>
             <a href="../demo/controls/fx-output.html"><div><h3>fx-output</h3>
                 <p>bound output, evaluated output and HTML output</p>
             </div></a>
+
             <a href="../demo/selects2.html"><div><h3>Selects (1)</h3>
                 <p>Static and bound select controls</p>
             </div></a>
-            <a href="../demo/selects.html"><div><h3>Selects (2)</h3>
+            <a href="../demo/selects.html"><div class="updated"><h3>Selects (2)</h3>
                 <p>A select depending on another select</p>
             </div></a>
-            <a href="../demo/selects3.html"><div><h3>Select Multiple</h3>
+            <a href="../demo/selects3.html"><div class="updated"><h3>Select Multiple</h3>
                 <p>Using <code>fx-items</code> to build a list of checkboxes from data</p>
             </div></a>
             <a href="../demo/selects4.html"><div><h3>Dynamic and static list widgets</h3>
@@ -276,12 +301,22 @@
             <a href="../demo/select-multiple.html"><div><h3>select multiple</h3>
                 <p>Binding an HTML multiple select</p>
             </div></a>
+
             <a href="../demo/radiobuttons.html"><div><h3>Radio buttons</h3>
-                <p>Fore and radio buttons</p>
+                <p>building radio button groups</p>
             </div></a>
             <a href="../demo/upload.html"><div class="updated"><h3><code>fx-upload</code></h3>
                 <p><code>fx-upload</code> allows to upload content and embed it into XML.</p>
             </div></a>
+            <a href="../demo/lab/on-demand.html"><div class="updated">
+                <h3>On Demand controls</h3>
+                <p>Hide away rarely or optional controls and let users insert them on demand.</p>
+            </div></a>
+            <a href="../demo/jinntap.html"><div class="updated">
+                <h3>Jinntap</h3>
+                <p>Use even more complex controls, like jinn-tap in your apps!</p>
+            </div></a>
+
         </section>
 
         <h2>UI Container</h2>
@@ -314,7 +349,7 @@
                 <h3>Accordion</h3>
                 <p>An accordion with <code>fx-switch</code> with CSS transition when switching panels</p>
             </div></a>
-            <a href="../demo/repeat-atomic.html"><div>
+            <a href="../demo/repeat-atomic.html"><div class="updated">
                 <h3>Repeat atomic values</h3>
                 <p>Repeating plain values from a sequence</p>
             </div></a>
@@ -322,8 +357,42 @@
                 <h3>Group relevance</h3>
                 <p>show/hide groups depending on their binding</p>
             </div></a>
+<!--
             <a href="../demo/repeat-attributes.html"><div>
                 <h3>Repeats via attributes</h3>
+                <p>Building repeats by using <code>data-ref</code> attribute</p>
+            </div></a>
+-->
+            <a href="../demo/repeat-attributes-1.html"><div class="updated">
+                <h3>Simple Table via attributes</h3>
+                <p>Building repeats by using <code>data-ref</code> attribute</p>
+            </div></a>
+            <a href="../demo/repeat-attributes-2.html"><div class="updated">
+                <h3>Repeating <code>td</code> elements in a single row</h3>
+                <p>Building repeats by using <code>data-ref</code> attribute</p>
+            </div></a>
+            <a href="../demo/repeat-attributes-3.html"><div class="updated">
+                <h3>Table with header via attributes</h3>
+                <p>Building repeats by using <code>data-ref</code> attribute</p>
+            </div></a>
+            <a href="../demo/repeat-attributes-4.html"><div class="updated">
+                <h3>Output an unordered list with repeat attributes</h3>
+                <p>Building repeats by using <code>data-ref</code> attribute</p>
+            </div></a>
+            <a href="../demo/repeat-attributes-5.html"><div class="updated">
+                <h3>Building a dynamic datalist</h3>
+                <p>Building repeats by using <code>data-ref</code> attribute</p>
+            </div></a>
+            <a href="../demo/repeat-attributes-6.html"><div class="updated">
+                <h3>Table using template expressions</h3>
+                <p>Building repeats by using <code>data-ref</code> attribute</p>
+            </div></a>
+            <a href="../demo/repeat-attributes-7.html"><div class="updated">
+                <h3>Table with header using template expressions</h3>
+                <p>Building repeats by using <code>data-ref</code> attribute</p>
+            </div></a>
+            <a href="../demo/repeat-attributes-8.html"><div class="updated">
+                <h3>Table with header and nested repeat within a cell</h3>
                 <p>Building repeats by using <code>data-ref</code> attribute</p>
             </div></a>
             <a href="../demo/lab/fore-component.html"><div>
@@ -335,19 +404,24 @@
                 <h3>Master/Detail repeats</h3>
                 <p>Create Master/Detail view with the help of the <code>index()</code> function.</p>
             </div></a>
-            <a href="../demo/lab/on-demand.html"><div class="updated">
-                <h3>On Demand controls</h3>
-                <p>Hide away rarely or optional controls and let users insert them on demand.</p>
-            </div></a>
             <a href="../demo/lab/on-demand-repeat.html"><div class="updated">
                 <h3>On Demand repeats</h3>
                 <p>Show a repeat on demand.</p>
             </div></a>
+            <a href="../demo/controls/fx-dialog.html"><div>
+                <h3>The fx-dialog element</h3>
+                <p>Modal dialog with <code>fx-dialog</code> and associated actions</p>
+            </div></a>
+
         </section>
 
         <h2>Actions and Events</h2>
         <section id="actions" class="three-col">
-            <a href="../demo/if.html"><div>
+            <a href="../demo/fx-message.html"><div>
+                <h3>The fx-message element</h3>
+                <p>Dissappearing, sticky and modal messages</p>
+            </div></a>
+            <a href="../demo/if.html"><div class="updated">
                 <h3>The <code>if</code> attribute</h3>
                 <p>Conditional actions with the <code>if</code> attribute</p>
             </div></a>
@@ -480,6 +554,10 @@
                 <h3>Function libraries</h3>
                 <p>Reuse your functions across multiple pages.</code></p>
             </div></a>
+			<a href="../demo/function-lib/function-lib2.html"><div class="updated">
+                <h3>External JS module with named functions</h3>
+                <p>Externalize JS functions in ES6 modules.</code></p>
+            </div></a>
         </section>
 
         <h2>JSON</h2>
@@ -492,22 +570,6 @@
 
 
 
-        <h2>By element</h2>
-        <section id="byelement" class="three-col">
-            <a href="../demo/controls/fx-dialog.html"><div>
-                <h3>The fx-dialog element</h3>
-                <p>Modal dialog with <code>fx-dialog</code> and associated actions</p>
-            </div></a>
-            <a href="../demo/fx-message.html"><div>
-                <h3>The fx-message element</h3>
-                <p>Dissappearing, sticky and modal messages</p>
-            </div></a>
-            <a href="../demo/controls/fx-output.html"><div>
-                <h3>The fx-output element</h3>
-                <p>Various options of the <code>fx-output</code> element</p>
-            </div></a>
-        </section>
-
         <h2>Bricks</h2>
         <section id="bricks" class="three-col">
             <a href="../demo/i18n/i18n.html"><div>
@@ -517,10 +579,6 @@
             <a href="../demo/i18n/i18n2.html"><div class="updated">
                 <h3>i18n2</h3>
                 <p>i18n with radios</p>
-            </div></a>
-            <a href="../demo/beforeunload.html"><div>
-                <h3>Page exit confirmation</h3>
-                <p>Show/do not show a exit confirmation depending on a condition</p>
             </div></a>
             <a href="../demo/auth.html"><div>
                 <h3>A simple login</h3>
@@ -599,6 +657,10 @@
             <a href="../demo/create-nodes/page.html"><div class="updated">
                 <h3>Auto-create XML structure with create-nodes</h3>
                 <p>Complex example creating a complete UBL document from UI binding expressions.</p>
+            </div></a>
+            <a id="featured" href="../demo/jinntap.html"><div class="updated">
+                <h3>Using JinnTap as control</h3>
+                <p>Using JinnTap WYSIWYG TEI editor as a Fore control.</p>
             </div></a>
         </section>
 

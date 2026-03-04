@@ -4,6 +4,7 @@ import { AbstractAction } from './abstract-action.js';
 import { evaluateXPathToString } from '../xpath-evaluation.js';
 import { Fore } from '../fore.js';
 import getInScopeContext from '../getInScopeContext';
+import { FxBind } from '../fx-bind';
 
 /**
  * `fx-setattribute` allows to create and set an attribute value in the data.
@@ -58,7 +59,18 @@ export default class FxSetattribute extends AbstractAction {
       return;
     }
     mi.node.setAttribute(this.attrName, this.attrValue);
+    const newModelItem = FxBind.createModelItem(
+      `${this.ref}/@${this.attrName}`,
+      mi.node.getAttributeNode(this.attrName),
+      this,
+      null,
+    );
+  // IMPORTANT: registerModelItem may return an existing canonical ModelItem for the same path.
+  // Always use the returned instance for notifications.
+  const canonical = this.getOwnerForm().getModel().registerModelItem(newModelItem);
+  this.getOwnerForm().addToBatchedNotifications(canonical);
     this.needsUpdate = true;
+  canonical.notify();
   }
 }
 

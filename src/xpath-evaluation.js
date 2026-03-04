@@ -1,3 +1,6 @@
+// src/xpath-evaluation.js
+// NOTE: This file is intentionally written as plain JS (no JSX) and must parse under Vite.
+
 import {
   evaluateXPath as fxEvaluateXPath,
   evaluateXPathToBoolean as fxEvaluateXPathToBoolean,
@@ -9,86 +12,136 @@ import {
   parseScript,
   registerCustomXPathFunction,
   registerXQueryModule,
+  Language,
 } from 'fontoxpath';
 
+import * as fx from 'fontoxpath';
 import { XPathUtil } from './xpath-util.js';
 import { prettifyXml } from './functions/common-function.js';
-import * as fx from 'fontoxpath';
+import { JSONDomFacade } from './json/JSONDomFacade.js';
 
 const XFORMS_NAMESPACE_URI = 'http://www.w3.org/2002/xforms';
-
 const createdNamespaceResolversByXPathQueryAndNode = new Map();
 
-// A global registry of function names that are declared in Fore by a developer using the
-// `fx-function` element. These should be available without providing a prefix as well
-export const globallyDeclaredFunctionLocalNames = [];
+const __jsonDomFacade = new JSONDomFacade();
 
-function getCachedNamespaceResolver(xpath, node) {
-  if (!createdNamespaceResolversByXPathQueryAndNode.has(xpath)) {
+// ------------------------------------------------------------
+// Helpers: Fore/model/instance
+// ------------------------------------------------------------
+
+function _getOwningFore(node) {
+  let n = node;
+  if (!n) return null;
+
+  if (n.nodeType === Node.ATTRIBUTE_NODE) n = n.ownerElement;
+  if (n.nodeType === Node.TEXT_NODE) n = n.parentNode;
+
+  // cross shadow
+  if (n?.parentNode?.nodeType === Node.DOCUMENT_FRAGMENT_NODE) n = n.parentNode.host;
+
+  return n?.closest ? n.closest('fx-fore') : null;
+}
+
+function _getModelFromFormElement(formElement) {
+  if (!formElement) return null;
+
+  if (typeof formElement.getModel === 'function') {
+    try {
+      return formElement.getModel();
+    } catch (_e) {}
+  }
+
+  const fore = _getOwningFore(formElement);
+  if (fore && typeof fore.getModel === 'function') {
+    try {
+      return fore.getModel();
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function _getInstanceFromFormElement(formElement, instanceId) {
+  const model = _getModelFromFormElement(formElement);
+  if (!model || typeof model.getInstance !== 'function') return null;
+  try {
+    return model.getInstance(instanceId);
+  } catch (_e) {
     return null;
   }
-  return createdNamespaceResolversByXPathQueryAndNode.get(xpath).get(node) || null;
 }
 
-function setCachedNamespaceResolver(xpath, node, resolver) {
-  if (!createdNamespaceResolversByXPathQueryAndNode.has(xpath)) {
-    return createdNamespaceResolversByXPathQueryAndNode.set(xpath, new Map());
-  }
-  return createdNamespaceResolversByXPathQueryAndNode.get(xpath).set(node, resolver);
+// IMPORTANT: source of truth is instance.type / @type
+function _isJsonInstance(instance) {
+  if (!instance) return false;
+  const t =
+    (typeof instance.getAttribute === 'function' && instance.getAttribute('type')) ||
+    instance.type ||
+    '';
+  return t === 'json';
 }
 
-const xhtmlNamespaceResolver = prefix => {
-  if (!prefix) {
-    return 'http://www.w3.org/1999/xhtml';
-  }
-  return undefined;
-};
-export function isInShadow(node) {
-  return node.getRootNode() instanceof ShadowRoot;
+function _isJsonNode(n) {
+  return !!n && typeof n === 'object' && n.__jsonlens__ === true;
+}
+
+function _getJsonRootNode(instance) {
+  return instance?.nodeset && _isJsonNode(instance.nodeset) ? instance.nodeset : null;
 }
 
 /**
- * Resolve an id in scope. Behaves like the algorithm defined on https://www.w3.org/community/xformsusers/wiki/XForms_2.0#idref-resolve
- *
- * @param {string} id
- * @param {Node} sourceObject
- * @param {string} nodeName
- *
- * @returns {HTMLElement} The element with that ID, resolved with respect to repeats
+ * Avoid calling any instance getters here.
+ * Some FxInstance implementations rebuild lenses / trigger evaluation in getters,
+ * which can recurse into XPath evaluation and overflow the stack.
  */
+function _getRawJsonRootValue(instance) {
+  if (!instance) return null;
+
+  // Canonical backing field in FxInstance
+  if (instance._instanceData !== undefined) return instance._instanceData;
+
+  // Alternate field name
+  if (instance.jsonData !== undefined) return instance.jsonData;
+
+  // Last fallback: unwrap a JSONNode root
+  if (instance.nodeset && instance.nodeset.__jsonlens__ === true) return instance.nodeset.value;
+
+  return null;
+}
+
+// ------------------------------------------------------------
+// Index('repeat') without XPath evaluation (prevents recursion)
+// ------------------------------------------------------------
+
+function _matchIndexExpr(expr) {
+  const s = String(expr ?? '').trim();
+  const m = s.match(/^index\s*\(\s*(['"])(.*?)\1\s*\)\s*$/);
+  return m ? m[2] : null;
+}
+
 export function resolveId(id, sourceObject, nodeName = null) {
   const query =
     'outermost(ancestor-or-self::fx-fore[1]/(descendant::fx-fore|descendant::*[@id = $id]))[not(self::fx-fore)]';
-  /*
-        if (nodeName === 'fx-instance') {
-            // Instance elements can only be in the `model` element
-            // query = 'ancestor-or-self::fx-fore[1]/fx-model/fx-instance[@id = $id]';
 
-            const fore = Fore.getFore(sourceObject);
-            const instances = fore.getModel().instances;
-            const targetInstance = instances.find(i => i.id === id);
-            return targetInstance;
-        return document.getElementById(id);
-	}
-    */
   if (sourceObject.nodeType === Node.TEXT_NODE) {
     sourceObject = sourceObject.parentNode;
   }
   if (sourceObject.nodeType === Node.ATTRIBUTE_NODE) {
     sourceObject = sourceObject.ownerElement;
   }
-  if (sourceObject.parentNode.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+  if (sourceObject.parentNode?.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
     sourceObject = sourceObject.parentNode.host;
   }
+
   const ownerForm =
     sourceObject.localName === 'fx-fore' ? sourceObject : sourceObject.closest('fx-fore');
+
   const elementsWithId = ownerForm.querySelectorAll(`[id='${id}']`);
   if (elementsWithId.length === 1) {
-    // A single one is found. Assume no ID reuse.
     const targetObject = elementsWithId[0];
-    if (nodeName && targetObject.localName !== nodeName) {
-      return null;
-    }
+    if (nodeName && targetObject.localName !== nodeName) return null;
     return targetObject;
   }
 
@@ -99,10 +152,7 @@ export function resolveId(id, sourceObject, nodeName = null) {
     { id },
     { namespaceResolver: xhtmlNamespaceResolver },
   );
-
-  if (allMatchingTargetObjects.length === 0) {
-    return null;
-  }
+  if (allMatchingTargetObjects.length === 0) return null;
 
   if (
     allMatchingTargetObjects.length === 1 &&
@@ -114,32 +164,11 @@ export function resolveId(id, sourceObject, nodeName = null) {
       { namespaceResolver: xhtmlNamespaceResolver },
     )
   ) {
-    // If the target element is not repeated, then the search for the target object is trivial since
-    // there is only one associated with the target element that bears the matching ID. This is true
-    // regardless of whether or not the source object is repeated. However, if the target element is
-    // repeated, then additional information must be used to help select a target object from among
-    // those associated with the identified target element.
     const targetObject = allMatchingTargetObjects[0];
-    if (nodeName && targetObject.localName !== nodeName) {
-      return null;
-    }
+    if (nodeName && targetObject.localName !== nodeName) return null;
     return targetObject;
   }
 
-  // SPEC:
-
-  // 12.2.1 References to Elements within a repeat Element
-
-  // When the target element that is identified by the IDREF of a source object has one or more
-  // repeat elements as ancestors, then the set of ancestor repeats are partitioned into two
-  // subsets, those in common with the source element and those that are not in common. Any ancestor
-  // repeat elements of the target element not in common with the source element are descendants of
-  // the repeat elements that the source and target element have in common, if any.
-
-  // For the repeat elements that are in common, the desired target object exists in the same set of
-  // run-time objects that contains the source object. Then, for each ancestor repeat of the target
-  // element that is not in common with the source element, the current index of the repeat
-  // determines the set of run-time objects that contains the desired target object.
   for (const ancestorRepeatItem of fxEvaluateXPathToNodes(
     'ancestor::fx-repeatitem => reverse()',
     sourceObject,
@@ -152,20 +181,13 @@ export function resolveId(id, sourceObject, nodeName = null) {
     );
     switch (foundTargetObjects.length) {
       case 0:
-        // Nothing found: ignore
         break;
       case 1: {
-        // A single one is found: the target object is directly in a common repeat
         const targetObject = foundTargetObjects[0];
-        if (nodeName && targetObject.localName !== nodeName) {
-          return null;
-        }
+        if (nodeName && targetObject.localName !== nodeName) return null;
         return targetObject;
       }
       default: {
-        // Multiple target objects are found: they are in a repeat that is not common with the
-        // source object We found a target object in a common repeat! We now need to find the one
-        // that is in the repeatitem identified at the current index
         const targetObject = foundTargetObjects.find(to =>
           fxEvaluateXPathToNodes(
             'every $ancestor of ancestor::fx-repeatitem satisfies $ancestor is $ancestor/../child::fx-repeatitem[../@repeat-index]',
@@ -174,34 +196,298 @@ export function resolveId(id, sourceObject, nodeName = null) {
             {},
           ),
         );
-        if (!targetObject) {
-          // Nothing valid found for whatever reason. This might be something dynamic?
-          return null;
-        }
-        if (nodeName && targetObject.localName !== nodeName) {
-          return null;
-        }
+        if (!targetObject) return null;
+        if (nodeName && targetObject.localName !== nodeName) return null;
         return targetObject;
       }
     }
   }
-  // We found no target objects in common repeats. The id is unresolvable
+
   return null;
 }
 
-// Make namespace resolving use the `instance` element that is related to here
-const xmlDocument = new DOMParser().parseFromString('<xml />', 'text/xml');
+/**
+ * Resolve index('repeatId') without evaluating XPath (prevents recursion).
+ * Returns:
+ *  - null   => not an index() expr
+ *  - number => resolved index (defaults to 1)
+ */
+function tryResolveIndexExpr(expr, formElementOrNode) {
+  try {
+    const repeatId = _matchIndexExpr(expr);
+    if (!repeatId) return null;
 
+    const source = formElementOrNode?.nodeType
+      ? formElementOrNode
+      : _getOwningFore(formElementOrNode);
+
+    const repeat =
+      (source && resolveId(repeatId, source, 'fx-repeat')) ||
+      _getOwningFore(source)?.querySelector?.(`#${CSS.escape(repeatId)}`);
+
+    if (!repeat) return 1;
+
+    const attr = repeat.getAttribute('index') ?? repeat.getAttribute('repeat-index');
+    let idx = Number(attr);
+
+    if (!Number.isFinite(idx) || idx < 1) {
+      if (typeof repeat.getIndex === 'function') idx = Number(repeat.getIndex());
+      else idx = Number(repeat.index);
+    }
+
+    return Number.isFinite(idx) && idx >= 1 ? idx : 1;
+  } catch (_e) {
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
+// JSON lookup handling
+// ------------------------------------------------------------
+
+function _looksLikeLookupExpr(expr) {
+  const s = String(expr ?? '').trim();
+  return s.includes('?');
+}
+
+/**
+ * Split "…?*[(predicate)]" => { base: "…?*", predicate: "(predicate)" }
+ * Works for:
+ *   instance('data')?movies?*[true()]
+ *   ?movies?*[instance('data')?ui?query = 'Ma']
+ */
+function _splitStarPredicate(expr) {
+  const s = String(expr ?? '').trim();
+  const m = s.match(/^(.*\?\*)\s*\[\s*([\s\S]+?)\s*\]\s*$/);
+  if (!m) return null;
+  return { base: m[1].trim(), predicate: m[2].trim() };
+}
+
+/**
+ * Determine whether expression is a "simple navigation" lens path that can be resolved
+ * by JSONNode.get chain:
+ * - no "*[predicate]" (handled separately)
+ * - no operators
+ * - no function calls beyond instance()/index()
+ * - predicates allowed ONLY in form "prop[NUMBER]" or "prop[index('repeat')]"
+ */
+function _isSimpleLookupExpr(expr) {
+  const s = String(expr ?? '').trim();
+
+  // star predicate is not simple (handled by _splitStarPredicate path)
+  if (/\?\*\s*\[/.test(s)) return false;
+
+  // operators => not simple
+  if (/[=<>!]=|[=<>]/.test(s)) return false;
+
+  // function calls other than instance()/index() => not simple
+  const parens = s.match(/[a-zA-Z_][\w.-]*\s*\(/g) || [];
+  const otherCalls = parens.filter(m => !/^instance\s*\(/.test(m) && !/^index\s*\(/.test(m));
+  if (otherCalls.length) return false;
+
+  // bracket predicates allowed only as array access
+  if (/\[[\s\S]*\]/.test(s)) {
+    const steps = s.split('?').filter(Boolean);
+    for (const step of steps) {
+      const bm = step.match(/^(.*?)\[(.+)\]$/);
+      if (!bm) continue;
+      const inside = bm[2].trim();
+      if (/^\d+$/.test(inside)) continue;
+      if (_matchIndexExpr(inside)) continue;
+      // allow index("x") too
+      if (/^index\s*\(\s*(['"])(.*?)\1\s*\)\s*$/.test(inside)) continue;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function _parseSimpleLookupPath(expr) {
+  const s = String(expr ?? '').trim();
+
+  let instanceId = null;
+  let rest = s;
+
+  const instExplicit = s.match(/^instance\s*\(\s*(['"])(.*?)\1\s*\)\s*(\?.*)$/);
+  if (instExplicit) {
+    instanceId = instExplicit[2];
+    rest = instExplicit[3];
+  } else {
+    const instDefault = s.match(/^instance\s*\(\s*\)\s*(\?.*)$/);
+    if (instDefault) {
+      instanceId = 'default';
+      rest = instDefault[1];
+    } else if (s.startsWith('.?')) rest = s.slice(1);
+    else if (!s.startsWith('?')) return null;
+  }
+
+  const steps = rest
+    .split('?')
+    .filter(Boolean)
+    .map(part => part.trim())
+    .filter(Boolean);
+
+  return { instanceId, steps, hasExplicitInstance: !!instExplicit };
+}
+
+function _getInstanceIdForLookupExpr(expr0, formElement) {
+  const parsed = _parseSimpleLookupPath(expr0);
+  if (parsed && parsed.instanceId) return parsed.instanceId;
+  return XPathUtil.getInstanceId(expr0, formElement);
+}
+
+function _isRelativeJsonLookup(expr0, contextNode) {
+  const s = String(expr0 ?? '').trim();
+  // relative lookup: starts with ? or .?
+  if (!(s.startsWith('?') || s.startsWith('.?'))) return false;
+  return _isJsonNode(contextNode);
+}
+
+function _resolveBracketIndex1(idxExpr, formElement) {
+  const t = String(idxExpr ?? '').trim();
+  if (/^\d+$/.test(t)) return Number(t);
+
+  // index('movies')
+  const rid = _matchIndexExpr(t);
+  if (rid) return tryResolveIndexExpr(`index('${rid}')`, formElement) ?? 1;
+
+  // index("movies")
+  const m = t.match(/^index\s*\(\s*(['"])(.*?)\1\s*\)\s*$/);
+  if (m) return tryResolveIndexExpr(`index('${m[2]}')`, formElement) ?? 1;
+
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+function _resolveSimpleLookupToJsonNode(expr, contextNode, formElement) {
+  const parsed = _parseSimpleLookupPath(expr);
+  if (!parsed) return null;
+
+  const trimmed = String(expr ?? '').trim();
+  const isExplicitInstance = trimmed.startsWith('instance(');
+
+  // IMPORTANT: always return a NEW array for children (copy),
+  // otherwise fx-repeat may keep a cached reference and miss inserts/deletes.
+  const getChildren = n => {
+    if (!n) return [];
+    const kids =
+        typeof n.getChildren === 'function'
+            ? n.getChildren() || []
+            : Array.isArray(n.children)
+                ? n.children
+                : [];
+    return Array.from(kids);
+  };
+
+  let node = null;
+
+  if (parsed.instanceId) {
+    const instance = _getInstanceFromFormElement(formElement, parsed.instanceId);
+    if (!_isJsonInstance(instance)) return null;
+    node = _getJsonRootNode(instance);
+    if (!node) return null;
+  } else if (!isExplicitInstance && _isJsonNode(contextNode)) {
+    node = contextNode;
+  } else {
+    const fallbackId = XPathUtil.getInstanceId(expr, formElement) || 'default';
+    const instance = _getInstanceFromFormElement(formElement, fallbackId);
+    if (!_isJsonInstance(instance)) return null;
+    node = _getJsonRootNode(instance);
+    if (!node) return null;
+  }
+
+  for (const rawStep of parsed.steps) {
+    if (!node) return null;
+
+    const step = String(rawStep);
+
+    if (step === '*') {
+      return getChildren(node);
+    }
+
+    if (/^\d+$/.test(step)) {
+      const idx0 = Number(step) - 1;
+      node = node.get?.(idx0) || null;
+      continue;
+    }
+
+    const bm = step.match(/^(.*?)\[(.+)\]$/);
+    if (bm) {
+      const prop = bm[1].trim();
+      const idxExpr = bm[2].trim();
+
+      const container = prop ? (typeof node.get === 'function' ? node.get(prop) : null) : node;
+      if (!container) return null;
+
+      const arrVal = container.value;
+      if (!Array.isArray(arrVal)) return null;
+
+      const idx1 = _resolveBracketIndex1(idxExpr, formElement);
+      if (!Number.isFinite(idx1) || idx1 < 1) return null;
+
+      const idx0 = idx1 - 1;
+      node = container.get?.(idx0) || null;
+      continue;
+    }
+
+    node = node.get?.(step) || null;
+  }
+
+  if (!node) return null;
+
+  if (Array.isArray(node.value)) return getChildren(node);
+
+  return node;
+}
+// ------------------------------------------------------------
+// RAW JSON evaluation helpers (FontoXPath over JS values)
+// ------------------------------------------------------------
+
+function getVariablesInScope(formElement) {
+  let closestActualFormElement = formElement;
+  while (closestActualFormElement && !('inScopeVariables' in closestActualFormElement)) {
+    closestActualFormElement =
+      closestActualFormElement.nodeType === Node.ATTRIBUTE_NODE
+        ? closestActualFormElement.ownerElement
+        : closestActualFormElement.parentNode;
+  }
+
+  if (!closestActualFormElement) return {};
+
+  const variables = {};
+  if (closestActualFormElement.inScopeVariables) {
+    for (const key of closestActualFormElement.inScopeVariables.keys()) {
+      const varElementOrValue = closestActualFormElement.inScopeVariables.get(key);
+      if (!varElementOrValue) continue;
+
+      if (varElementOrValue.nodeType) variables[key] = varElementOrValue.value;
+      else variables[key] = varElementOrValue;
+    }
+  }
+  return variables;
+}
+
+// ------------------------------------------------------------
+// Namespace resolver infra (XML only)
+// ------------------------------------------------------------
+
+const xhtmlNamespaceResolver = prefix => {
+  if (!prefix) return 'http://www.w3.org/1999/xhtml';
+  return undefined;
+};
+
+export function isInShadow(node) {
+  return node.getRootNode() instanceof ShadowRoot;
+}
+
+const xmlDocument = new DOMParser().parseFromString('<xml />', 'text/xml');
 const instanceReferencesByQuery = new Map();
 
 function findInstanceReferences(xpathQuery) {
-  if (!xpathQuery.includes('instance')) {
-    // No call to the instance function anyway: short-circuit and prevent AST processing
-    return [];
-  }
-  if (instanceReferencesByQuery.has(xpathQuery)) {
-    return instanceReferencesByQuery.get(xpathQuery);
-  }
+  if (!xpathQuery.includes('instance')) return [];
+  if (instanceReferencesByQuery.has(xpathQuery)) return instanceReferencesByQuery.get(xpathQuery);
+
   const xpathAST = parseScript(xpathQuery, {}, xmlDocument);
   const instanceReferences = fxEvaluateXPathToStrings(
     `descendant::xqx:functionCallExpr
@@ -219,60 +505,61 @@ function findInstanceReferences(xpathQuery) {
   );
 
   instanceReferencesByQuery.set(xpathQuery, instanceReferences);
-
   return instanceReferences;
 }
-/**
- * @typedef {function(string):string} NamespaceResolver
- */
 
-/**
- * @function
- * Resolve a namespace. Needs a namespace prefix and the element that is most closely related to the
- * XPath in which the namespace is being resolved. The prefix will be resolved by using the
- * ancestry of said element.
- *
- * It has two ways of doing so:
- *
- * - If the prefix is defined in an `xmlns:XXX="YYY"` namespace declaration, it will return 'YYY'.
- * - If the prefix is the empty prefix and there is an `xpath-default-namespace="YYY"` attribute in
- * - the * ancestry, that attribute will be used and 'YYY' will be returned
- *
- * @param  {string} xpathQuery
- * @param  {HTMLElement} formElement
- * @returns {NamespaceResolver} The namespace resolver for this context
- */
-function createNamespaceResolver(xpathQuery, formElement) {
-  const cachedResolver = getCachedNamespaceResolver(xpathQuery, formElement);
-  if (cachedResolver) {
-    return cachedResolver;
+function getCachedNamespaceResolver(xpath, node) {
+  if (!createdNamespaceResolversByXPathQueryAndNode.has(xpath)) return null;
+  return createdNamespaceResolversByXPathQueryAndNode.get(xpath).get(node) || null;
+}
+
+function setCachedNamespaceResolver(xpath, node, resolver) {
+  if (!createdNamespaceResolversByXPathQueryAndNode.has(xpath)) {
+    createdNamespaceResolversByXPathQueryAndNode.set(xpath, new Map());
   }
+  createdNamespaceResolversByXPathQueryAndNode.get(xpath).set(node, resolver);
+}
+
+export function createNamespaceResolver(xpathQuery, formElement) {
+  const cachedResolver = getCachedNamespaceResolver(xpathQuery, formElement);
+  if (cachedResolver) return cachedResolver;
+
+  const provisionalResolver = prefix => (prefix ? undefined : '');
+  setCachedNamespaceResolver(xpathQuery, formElement, provisionalResolver);
+
   let instanceReferences = findInstanceReferences(xpathQuery);
+
+  const closestRefExcludingSelf = el => {
+    if (!el) return null;
+
+    let n = el;
+    if (n.nodeType === Node.ATTRIBUTE_NODE) n = n.ownerElement;
+    if (n?.parentNode?.nodeType === Node.DOCUMENT_FRAGMENT_NODE) n = n.parentNode.host;
+
+    let start = n?.parentNode;
+    if (start?.nodeType === Node.DOCUMENT_FRAGMENT_NODE) start = start.host;
+
+    return start?.closest ? start.closest('[ref]') : null;
+  };
+
   if (instanceReferences.length === 0) {
-    // No instance functions. Look up further in the hierarchy to see if we can deduce the intended context from there
-    const ancestorComponent =
-      formElement.parentNode &&
-      formElement.parentNode.nodeType === formElement.ELEMENT_NODE &&
-      formElement.parentNode.closest('[ref]');
-    if (ancestorComponent) {
-      const resolver = createNamespaceResolver(
-        ancestorComponent.getAttribute('ref'),
-        ancestorComponent,
-      );
-      setCachedNamespaceResolver(xpathQuery, formElement, resolver);
-      return resolver;
+    const ancestorComponent = closestRefExcludingSelf(formElement);
+
+    if (ancestorComponent && ancestorComponent !== formElement) {
+      const ancestorRef = ancestorComponent.getAttribute('ref');
+      if (ancestorRef && ancestorRef !== xpathQuery) {
+        const resolver = createNamespaceResolver(ancestorRef, ancestorComponent);
+        setCachedNamespaceResolver(xpathQuery, formElement, resolver);
+        return resolver;
+      }
     }
-    // Nothing found: let's just assume we're supposed to use the `default` instance
+
     instanceReferences = ['default'];
   }
 
   if (instanceReferences.length === 1) {
-    // console.log(`resolving ${xpathQuery} with ${instanceReferences[0]}`);
     let instance;
     if (instanceReferences[0] === 'default') {
-      /**
-       * @type {HTMLElement}
-       */
       const actualForeElement = fxEvaluateXPathToFirstNode(
         'ancestor-or-self::fx-fore[1]',
         formElement,
@@ -280,54 +567,25 @@ function createNamespaceResolver(xpathQuery, formElement) {
         null,
         { namespaceResolver: xhtmlNamespaceResolver },
       );
-
       instance = actualForeElement && actualForeElement.querySelector('fx-instance');
     } else {
       instance = resolveId(instanceReferences[0], formElement, 'fx-instance');
     }
+
     if (instance && instance.hasAttribute('xpath-default-namespace')) {
       const xpathDefaultNamespace = instance.getAttribute('xpath-default-namespace');
-      /*
-            console.log(
-              `Resolving the xpath ${xpathQuery} with the default namespace set to ${xpathDefaultNamespace}`,
-            );
-			*/
-      /**
-       * @type {NamespaceResolver}
-       */
-      const resolveNamespacePrefix = prefix => {
-        if (!prefix) {
-          return xpathDefaultNamespace;
-        }
-        return undefined;
-      };
+      const resolveNamespacePrefix = prefix => (!prefix ? xpathDefaultNamespace : undefined);
       setCachedNamespaceResolver(xpathQuery, formElement, resolveNamespacePrefix);
       return resolveNamespacePrefix;
     }
   }
-  /*
-  if (instanceReferences.length > 1) {
-    console.warn(
-      `More than one instance is used in the query "${xpathQuery}". The default namespace resolving will be used`,
-    );
-  }
-*/
 
   const xpathDefaultNamespace =
     fxEvaluateXPathToString('ancestor-or-self::*/@xpath-default-namespace[last()]', formElement) ||
     '';
 
-  /**
-   * @type {NamespaceResolver}
-   */
   const resolveNamespacePrefix = function resolveNamespacePrefix(prefix) {
-    if (prefix === '') {
-      return xpathDefaultNamespace;
-    }
-
-    // Note: ideally we should use Node#lookupNamespaceURI. However, the nodes we are passed are
-    // XML. The best we can do is emulate the `xmlns:xxx` namespace declarations by regarding them as
-    // attributes. Which they technically ARE NOT!
+    if (prefix === '') return xpathDefaultNamespace;
 
     return fxEvaluateXPathToString(
       'ancestor-or-self::*/@*[name() = "xmlns:" || $prefix][last()]',
@@ -343,20 +601,19 @@ function createNamespaceResolver(xpathQuery, formElement) {
 
 function createNamespaceResolverForNode(query, contextNode, formElement) {
   if (((contextNode && contextNode.ownerDocument) || contextNode) === window.document) {
-    // Running a query on the HTML DOM. Don't bother resolving namespaces in any other way
     return xhtmlNamespaceResolver;
   }
   return createNamespaceResolver(query, formElement);
 }
 
-/**
- * Implementation of the functionNameResolver passed to FontoXPath to
- * redirect function resolving for unprefixed functions to either the fn or the xf namespace
- */
-// eslint-disable-next-line no-unused-vars
+// ------------------------------------------------------------
+// Function resolver
+// ------------------------------------------------------------
+
+export const globallyDeclaredFunctionLocalNames = [];
+
 function functionNameResolver({ prefix, localName }, _arity) {
   switch (localName) {
-    // TODO: put the full XForms library functions set here
     case 'context':
     case 'base64encode':
     case 'boolean-from-string':
@@ -386,8 +643,6 @@ function functionNameResolver({ prefix, localName }, _arity) {
       return { namespaceURI: XFORMS_NAMESPACE_URI, localName };
     default:
       if (prefix === '' && globallyDeclaredFunctionLocalNames.includes(localName)) {
-        // The function has been declared without a prefix and is called here without a prefix.
-        // Just make this work. It is the developer-friendly way
         return { namespaceURI: 'http://www.w3.org/2005/xquery-local-functions', localName };
       }
       if (prefix === 'fn' || prefix === '') {
@@ -400,107 +655,410 @@ function functionNameResolver({ prefix, localName }, _arity) {
   }
 }
 
-/**
- * Get the variables in scope of the form element. These are the values of the variables that
- * logically precede the formElement that declares the XPath
- *
- * @param  {Node}  formElement  The element that declares the XPath
- *
- * @returns  {Object}  A key-value mapping of the variables
- */
-function getVariablesInScope(formElement) {
-  let closestActualFormElement = formElement;
-  while (closestActualFormElement && !('inScopeVariables' in closestActualFormElement)) {
-    closestActualFormElement =
-      closestActualFormElement.nodeType === Node.ATTRIBUTE_NODE
-        ? closestActualFormElement.ownerElement
-        : closestActualFormElement.parentNode;
+// ------------------------------------------------------------
+// JSON star-predicate filtering using FontoXPath per item
+// ------------------------------------------------------------
+
+function _jsonAtomicFromResolved(resolved) {
+  if (resolved === null || resolved === undefined) return '';
+
+  // Arrays: join atomic values with spaces (XPath-ish).
+  if (Array.isArray(resolved)) {
+    return resolved
+      .map(r => _jsonAtomicFromResolved(r))
+      .filter(s => s !== null && s !== undefined && s !== '')
+      .join(' ');
   }
 
-  if (!closestActualFormElement) {
-    return {};
-  }
+  // JSONNode: prefer getValue() if present.
+  if (_isJsonNode(resolved)) {
+    const v = typeof resolved.getValue === 'function' ? resolved.getValue() : resolved.value;
 
-  const variables = {};
-  if (closestActualFormElement.inScopeVariables) {
-    for (const key of closestActualFormElement.inScopeVariables.keys()) {
-      const varElementOrValue = closestActualFormElement.inScopeVariables.get(key);
-      if (!varElementOrValue) {
-        continue;
-      }
-      if (varElementOrValue.nodeType) {
-        // We are a var element, set the value to the value computed there
-        variables[key] = varElementOrValue.value;
-        // variables[key] = varElementOrValue.inScopeVariables.get(key);
-      } else {
-        // We are a direct value. This is used to leak in event variables
-        variables[key] = varElementOrValue;
-      }
+    if (v === null || v === undefined) return '';
+
+    const t = typeof v;
+    if (t === 'string') return v;
+    if (t === 'number' || t === 'boolean' || t === 'bigint') return String(v);
+
+    try {
+      return JSON.stringify(v);
+    } catch (_e) {
+      return '';
     }
   }
-  return variables;
+
+  // Primitives
+  const t = typeof resolved;
+  if (t === 'string') return resolved;
+  if (t === 'number' || t === 'boolean' || t === 'bigint') return String(resolved);
+
+  // Other objects
+  try {
+    return JSON.stringify(resolved);
+  } catch (_e) {
+    return String(resolved);
+  }
+}
+function _materializeInstanceLookupsInPredicate(predicateExpr, currentJsonNode, formElement) {
+  const src = String(predicateExpr ?? '');
+  let out = '';
+  const extraVars = {};
+  let varCount = 0;
+
+  let inSingle = false;
+  let inDouble = false;
+
+  const isBoundary = ch =>
+    ch === undefined ||
+    ch === null ||
+    /\s/.test(ch) ||
+    ch === ',' ||
+    ch === ')' ||
+    ch === ']' ||
+    ch === '+' ||
+    ch === '-' ||
+    ch === '*' ||
+    ch === '=' ||
+    ch === '>' ||
+    ch === '<' ||
+    ch === '!' ||
+    ch === '|' ||
+    ch === '&';
+
+  function readInstanceLensAt(start) {
+    // Reads `instance(...)` followed by one or more `?step` parts.
+    if (!src.slice(start).match(/^instance\s*\(/)) return null;
+
+    // Find matching ')'
+    let j = start;
+    let inS = false;
+    let inD = false;
+    let depth = 0;
+
+    while (j < src.length) {
+      const ch = src[j];
+
+      if (ch === "'" && !inD) {
+        inS = !inS;
+        j += 1;
+        continue;
+      }
+      if (ch === '"' && !inS) {
+        inD = !inD;
+        j += 1;
+        continue;
+      }
+      if (inS || inD) {
+        j += 1;
+        continue;
+      }
+
+      if (ch === '(') depth += 1;
+      else if (ch === ')') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+      j += 1;
+    }
+
+    if (j >= src.length) return null;
+
+    // Must be followed by '?' (after optional whitespace)
+    let k = j + 1;
+    while (k < src.length && /\s/.test(src[k])) k += 1;
+    if (src[k] !== '?') return null;
+
+    // Consume until boundary, respecting bracket depth and quotes
+    k += 1;
+    let bracketDepth = 0;
+    inS = false;
+    inD = false;
+
+    while (k < src.length) {
+      const ch = src[k];
+
+      if (ch === "'" && !inD) {
+        inS = !inS;
+        k += 1;
+        continue;
+      }
+      if (ch === '"' && !inS) {
+        inD = !inD;
+        k += 1;
+        continue;
+      }
+      if (inS || inD) {
+        k += 1;
+        continue;
+      }
+
+      if (ch === '[') bracketDepth += 1;
+      else if (ch === ']') {
+        if (bracketDepth > 0) bracketDepth -= 1;
+        else break;
+      }
+
+      if (bracketDepth === 0 && isBoundary(ch)) break;
+      k += 1;
+    }
+
+    return { raw: src.slice(start, k), end: k };
+  }
+
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      out += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      out += ch;
+      continue;
+    }
+
+    if (!inSingle && !inDouble) {
+      const lens = readInstanceLensAt(i);
+      if (lens && _looksLikeLookupExpr(lens.raw) && _isSimpleLookupExpr(lens.raw)) {
+        const varName = `__fxp${varCount++}`;
+
+        // Resolve the lookup using the existing JSON lens resolver.
+        const resolved = _resolveSimpleLookupToJsonNode(lens.raw, currentJsonNode, formElement);
+        extraVars[varName] = _jsonAtomicFromResolved(resolved);
+
+        out += `$${varName}`;
+        i = lens.end - 1;
+        continue;
+      }
+    }
+
+    out += ch;
+  }
+
+  return { expr: out.trim(), extraVars };
 }
 
-/**
- * Evaluate an XPath to _any_ type. When possible, prefer to use any other function to ensure the
- * type of the output is more predictable.
- *
- * @param  {string} xpath  The XPath to run
- * @param  {Node} contextNode The start of the XPath
- * @param  {import('./ForeElementMixin.js').default} formElement  The form element associated to the XPath
- * @param  {Object} variables  Any variables to pass to the XPath
- * @param  {Object} options  Any options to pass to the XPath
- */
-/*
-export function evaluateXPath(xpath, contextNode, formElement, variables = {}, options={}, domFacade = null) {
-    const namespaceResolver = createNamespaceResolverForNode(xpath, contextNode, formElement);
+function _filterJsonNodesByPredicate(nodes, predicateExpr, formElement, variables = {}) {
+  const pred = String(predicateExpr ?? '').trim();
+
+  // Fast paths: avoid swallowing errors and filtering out everything.
+  if (pred === 'true()' || pred === 'true') {
+    return (nodes || []).filter(_isJsonNode);
+  }
+  if (pred === 'false()' || pred === 'false') {
+    return [];
+  }
+
+  // Special-case: contains(., <something>) used by json-movies-explorer search.
+  // This does NOT attempt to be a full XPath predicate engine; it is a safe, deterministic
+  // shortcut that prevents "no rows" when DOMFacade support is incomplete.
+  const containsMatch = pred.match(/^contains\s*\(\s*\.\s*,\s*([\s\S]+)\s*\)\s*$/);
+  if (containsMatch) {
+    const rhs = containsMatch[1].trim();
+
+    return (nodes || []).filter(n => {
+      if (!_isJsonNode(n)) return false;
+
+      // resolve RHS to a string needle
+      let needle = '';
+      const quoted = rhs.match(/^(['"])([\s\S]*)\1$/);
+      if (quoted) {
+        needle = String(quoted[2] ?? '');
+      } else {
+        // If RHS is a lens expression, resolve it (instance('data')?ui?query, ?query, etc.)
+        // Use the current item node as context for relative lookups.
+        const resolved = _looksLikeLookupExpr(rhs)
+          ? _resolveSimpleLookupToJsonNode(rhs, n, formElement)
+          : null;
+
+        needle = _jsonAtomicFromResolved(resolved);
+
+        // Also allow variable references like $q in predicates
+        if (!needle && rhs.startsWith('$')) {
+          const key = rhs.slice(1);
+          const inScope = getVariablesInScope(formElement);
+          const v =
+            (variables && key in variables ? variables[key] : null) ??
+            (key in inScope ? inScope[key] : null);
+          needle = _jsonAtomicFromResolved(v);
+        }
+      }
+
+      // XPath contains(haystack,'') is true
+      if (needle === '') return true;
+
+      // haystack: stringify the whole item (so search matches anywhere)
+      const v = typeof n.getValue === 'function' ? n.getValue() : n.value;
+      let haystack = '';
+      if (v === null || v === undefined) haystack = '';
+      else if (typeof v === 'string') haystack = v;
+      else {
+        try {
+          haystack = JSON.stringify(v);
+        } catch (_e) {
+          haystack = String(v);
+        }
+      }
+
+      return haystack.includes(needle);
+    });
+  }
+
+  // General case: evaluate predicate using FontoXPath against the JSONNode
+  // (keeps full function/variable support when DOMFacade is sufficient).
+  const inScope = getVariablesInScope(formElement);
+  const domFacade = __jsonDomFacade;
+
+  const out = [];
+  for (const n of nodes || []) {
+    if (!_isJsonNode(n)) continue;
+
+    try {
+      // Replace instance(...)?... lookups inside predicate with variables so FontoXPath
+      // does not need to understand the lookup operator.
+      const { expr: predExpr, extraVars } = _materializeInstanceLookupsInPredicate(
+        pred,
+        n,
+        formElement,
+      );
+      const mergedVars = { ...inScope, ...variables, ...extraVars };
+
+      const ok = fxEvaluateXPathToBoolean(predExpr, n, domFacade, mergedVars, {
+        currentContext: { formElement },
+        moduleImports: { xf: XFORMS_NAMESPACE_URI },
+        functionNameResolver,
+        namespaceResolver: null,
+        language: Language.XPATH_3_1_LANGUAGE,
+        xmlSerializer: new XMLSerializer(),
+      });
+
+      if (ok) out.push(n);
+    } catch (_e) {
+      // If predicate evaluation fails, treat as false for that item.
+    }
+  }
+
+  return out;
+}
+
+// ------------------------------------------------------------
+// Exported evaluation helpers
+// ------------------------------------------------------------
+
+export function evaluateXPath(
+  xpath,
+  contextNode,
+  formElement,
+  variables = {},
+  options = {},
+  domFacade = null,
+) {
+  const expr0 = String(xpath ?? '').trim();
+
+  try {
+    const idx = tryResolveIndexExpr(expr0, formElement);
+    if (idx !== null) return [idx];
+
+    // Fast-path: evaluating '.' on a JSONNode should just yield the current node.
+    // Doing this through FontoXPath can recurse into refresh and overflow the stack.
+    if (_isJsonNode(contextNode) && expr0 === '.') {
+      return [contextNode];
+    }
+
+    // If we are evaluating in a JSON repeat/item context, use the JSON DOM facade
+    // even for non-lookup expressions like `name` / `value`.
+    if (_isJsonNode(contextNode) && !_looksLikeLookupExpr(expr0)) {
+      const variablesInScope = getVariablesInScope(formElement);
+      return fxEvaluateXPath(
+        expr0,
+        contextNode,
+        __jsonDomFacade,
+        { ...variablesInScope, ...variables },
+        fxEvaluateXPath.ALL_RESULTS_TYPE,
+        {
+          debug: true,
+          currentContext: { formElement, variables },
+          moduleImports: { xf: XFORMS_NAMESPACE_URI },
+          functionNameResolver,
+          namespaceResolver: null,
+          language: Language.XPATH_3_1_LANGUAGE,
+          xmlSerializer: new XMLSerializer(),
+          ...options,
+        },
+      );
+    }
+
+    if (_looksLikeLookupExpr(expr0)) {
+      const relativeJson = _isRelativeJsonLookup(expr0, contextNode);
+
+      // Only attempt to resolve an instance when this is not a relative lookup.
+      const instanceId = relativeJson ? null : _getInstanceIdForLookupExpr(expr0, formElement);
+      const instance = relativeJson ? null : _getInstanceFromFormElement(formElement, instanceId);
+
+      if (!relativeJson && !instance) {
+        formElement?.dispatchEvent?.(
+          new CustomEvent('error', {
+            composed: false,
+            bubbles: true,
+            detail: {
+              origin: formElement,
+              message: `Instance with id '${instanceId}' not found for expression '${expr0}'`,
+              expr: expr0,
+              level: 'Error',
+            },
+          }),
+        );
+      }
+
+      if (relativeJson || _isJsonInstance(instance)) {
+        // ✅ Star predicate: resolve base nodeset via lens, then filter with real XPath predicate per item.
+        const sp = _splitStarPredicate(expr0);
+        if (sp) {
+          const baseResolved = _resolveSimpleLookupToJsonNode(sp.base, contextNode, formElement);
+          const baseNodes = Array.isArray(baseResolved)
+            ? baseResolved
+            : baseResolved
+              ? [baseResolved]
+              : [];
+          return _filterJsonNodesByPredicate(baseNodes, sp.predicate, formElement, variables);
+        }
+
+        // ✅ Simple navigation (no predicates/operators)
+        if (_isSimpleLookupExpr(expr0)) {
+          const resolved = _resolveSimpleLookupToJsonNode(expr0, contextNode, formElement);
+          if (resolved === null) return [];
+          if (Array.isArray(resolved)) return resolved;
+          return [resolved];
+        }
+
+        return [];
+      }
+    }
+
+    const namespaceResolver = createNamespaceResolverForNode(expr0, contextNode, formElement);
     const variablesInScope = getVariablesInScope(formElement);
 
     return fxEvaluateXPath(
-        xpath,
-        contextNode,
-        domFacade,
-        {...variablesInScope, ...variables},
-        fxEvaluateXPath.ALL_RESULTS_TYPE,
-        {
-			debug: true,
-            currentContext: {formElement, variables},
-            moduleImports: {
-                xf: XFORMS_NAMESPACE_URI,
-            },
-            functionNameResolver,
-            namespaceResolver,
-			language: options.language || evaluateXPath.XPATH_3_1
-        },
-    );
-}
-*/
-export function evaluateXPath(xpath, contextNode, formElement, variables = {}, options = {}) {
-  try {
-    const namespaceResolver = createNamespaceResolverForNode(xpath, contextNode, formElement);
-    const variablesInScope = getVariablesInScope(formElement);
-
-    const result = fxEvaluateXPath(
-      xpath,
+      expr0,
       contextNode,
-      null,
+      domFacade,
       { ...variablesInScope, ...variables },
       fxEvaluateXPath.ALL_RESULTS_TYPE,
       {
         debug: true,
         currentContext: { formElement, variables },
-        moduleImports: {
-          xf: XFORMS_NAMESPACE_URI,
-        },
+        moduleImports: { xf: XFORMS_NAMESPACE_URI },
         functionNameResolver,
         namespaceResolver,
-        language: options.language || fxEvaluateXPath.XPATH_3_1_LANGUAGE,
+        language: Language.XPATH_3_1_LANGUAGE,
+        xmlSerializer: new XMLSerializer(),
+        ...options,
       },
     );
-    // console.log('evaluateXPath',xpath, result);
-    return result;
   } catch (e) {
-    formElement.dispatchEvent(
+    formElement?.dispatchEvent?.(
       new CustomEvent('error', {
         composed: false,
         bubbles: true,
@@ -512,50 +1070,71 @@ export function evaluateXPath(xpath, contextNode, formElement, variables = {}, o
         },
       }),
     );
-
-    /*
-        formElement.dispatchEvent(
-            new CustomEvent('error', {
-                composed: false,
-                bubbles: true,
-                cancelable:true,
-                detail: {
-                    origin: formElement,
-                    message: `Expression '${xpath}' failed`,
-                    expr:xpath,
-                    level:'Error'},
-            }),
-        );
-*/
-    // Return 'nothing' in hope the rest of the page can forgive this
     return [];
   }
 }
-/**
- * Evaluate an XPath to the first Node
- *
- * @param  {string} xpath  The XPath to run
- * @param  {Node} contextNode The start of the XPath
- * @param  {import('./ForeElementMixin.js').default} formElement  The form element associated to the XPath
- * @returns {Node} The first node found in the XPath
- */
+
 export function evaluateXPathToFirstNode(xpath, contextNode, formElement) {
+  const expr0 = String(xpath ?? '').trim();
+
   try {
-    const namespaceResolver = createNamespaceResolverForNode(xpath, contextNode, formElement);
+    if (_isJsonNode(contextNode) && expr0 === '.') {
+      return contextNode;
+    }
+    if (_isJsonNode(contextNode) && !_looksLikeLookupExpr(expr0)) {
+      const variablesInScope = getVariablesInScope(formElement);
+      return fxEvaluateXPathToFirstNode(expr0, contextNode, __jsonDomFacade, variablesInScope, {
+        currentContext: { formElement },
+        functionNameResolver,
+        moduleImports: { xf: XFORMS_NAMESPACE_URI },
+        namespaceResolver: null,
+        language: Language.XPATH_3_1_LANGUAGE,
+        xmlSerializer: new XMLSerializer(),
+      });
+    }
+
+    if (_looksLikeLookupExpr(expr0)) {
+      const relativeJson = _isRelativeJsonLookup(expr0, contextNode);
+      const instanceId = relativeJson ? null : _getInstanceIdForLookupExpr(expr0, formElement);
+      const instance = relativeJson ? null : _getInstanceFromFormElement(formElement, instanceId);
+
+      if (relativeJson || _isJsonInstance(instance)) {
+        const sp = _splitStarPredicate(expr0);
+        if (sp) {
+          const baseResolved = _resolveSimpleLookupToJsonNode(sp.base, contextNode, formElement);
+          const baseNodes = Array.isArray(baseResolved)
+            ? baseResolved
+            : baseResolved
+              ? [baseResolved]
+              : [];
+          const filtered = _filterJsonNodesByPredicate(baseNodes, sp.predicate, formElement);
+          return filtered[0] || null;
+        }
+
+        if (_isSimpleLookupExpr(expr0)) {
+          const resolved = _resolveSimpleLookupToJsonNode(expr0, contextNode, formElement);
+          if (!resolved) return null;
+          if (Array.isArray(resolved)) return resolved[0] || null;
+          return resolved;
+        }
+
+        return null;
+      }
+    }
+
+    const namespaceResolver = createNamespaceResolverForNode(expr0, contextNode, formElement);
     const variablesInScope = getVariablesInScope(formElement);
-    const result = fxEvaluateXPathToFirstNode(xpath, contextNode, null, variablesInScope, {
-      defaultFunctionNamespaceURI: XFORMS_NAMESPACE_URI,
-      moduleImports: {
-        xf: XFORMS_NAMESPACE_URI,
-      },
+
+    return fxEvaluateXPathToFirstNode(expr0, contextNode, null, variablesInScope, {
       currentContext: { formElement },
       functionNameResolver,
+      moduleImports: { xf: XFORMS_NAMESPACE_URI },
       namespaceResolver,
+      language: Language.XPATH_3_1_LANGUAGE,
+      xmlSerializer: new XMLSerializer(),
     });
-    // console.log('evaluateXPathToFirstNode',xpath, result);
-    return result;
   } catch (e) {
-    formElement.dispatchEvent(
+    formElement?.dispatchEvent?.(
       new CustomEvent('error', {
         composed: false,
         bubbles: true,
@@ -567,34 +1146,70 @@ export function evaluateXPathToFirstNode(xpath, contextNode, formElement) {
         },
       }),
     );
+    return null;
   }
 }
 
-/**
- * Evaluate an XPath to all nodes
- *
- * @param  {string} xpath  The XPath to run
- * @param  {Node} contextNode The start of the XPath
- * @param  {import('./ForeElementMixin.js').default} formElement  The form element associated to the XPath
- * @return {Node[]}  All nodes
- */
 export function evaluateXPathToNodes(xpath, contextNode, formElement) {
+  const expr0 = String(xpath ?? '').trim();
+
   try {
-    const namespaceResolver = createNamespaceResolverForNode(xpath, contextNode, formElement);
+    if (_isJsonNode(contextNode) && expr0 === '.') {
+      return [contextNode];
+    }
+    if (_isJsonNode(contextNode) && !_looksLikeLookupExpr(expr0)) {
+      const variablesInScope = getVariablesInScope(formElement);
+      return fxEvaluateXPathToNodes(expr0, contextNode, __jsonDomFacade, variablesInScope, {
+        currentContext: { formElement },
+        functionNameResolver,
+        moduleImports: { xf: XFORMS_NAMESPACE_URI },
+        namespaceResolver: null,
+        language: Language.XPATH_3_1_LANGUAGE,
+        xmlSerializer: new XMLSerializer(),
+      });
+    }
+
+    if (_looksLikeLookupExpr(expr0)) {
+      const relativeJson = _isRelativeJsonLookup(expr0, contextNode);
+      const instanceId = relativeJson ? null : _getInstanceIdForLookupExpr(expr0, formElement);
+      const instance = relativeJson ? null : _getInstanceFromFormElement(formElement, instanceId);
+
+      if (relativeJson || _isJsonInstance(instance)) {
+        const sp = _splitStarPredicate(expr0);
+        if (sp) {
+          const baseResolved = _resolveSimpleLookupToJsonNode(sp.base, contextNode, formElement);
+          const baseNodes = Array.isArray(baseResolved)
+            ? baseResolved
+            : baseResolved
+              ? [baseResolved]
+              : [];
+          return _filterJsonNodesByPredicate(baseNodes, sp.predicate, formElement);
+        }
+
+        if (_isSimpleLookupExpr(expr0)) {
+          const resolved = _resolveSimpleLookupToJsonNode(expr0, contextNode, formElement);
+          if (!resolved) return [];
+          if (Array.isArray(resolved)) return resolved;
+          return [resolved];
+        }
+
+        return [];
+      }
+    }
+
+    const namespaceResolver = createNamespaceResolverForNode(expr0, contextNode, formElement);
     const variablesInScope = getVariablesInScope(formElement);
 
-    const result = fxEvaluateXPathToNodes(xpath, contextNode, null, variablesInScope, {
+    return fxEvaluateXPathToNodes(expr0, contextNode, null, variablesInScope, {
       currentContext: { formElement },
       functionNameResolver,
-      moduleImports: {
-        xf: XFORMS_NAMESPACE_URI,
-      },
+      moduleImports: { xf: XFORMS_NAMESPACE_URI },
       namespaceResolver,
+      language: Language.XPATH_3_1_LANGUAGE,
+      xmlSerializer: new XMLSerializer(),
     });
-    // console.log('evaluateXPathToNodes',xpath, result);
-    return result;
   } catch (e) {
-    formElement.dispatchEvent(
+    formElement?.dispatchEvent?.(
       new CustomEvent('error', {
         composed: false,
         bubbles: true,
@@ -606,32 +1221,96 @@ export function evaluateXPathToNodes(xpath, contextNode, formElement) {
         },
       }),
     );
+    return [];
   }
 }
 
-/**
- * Evaluate an XPath to a boolean
- *
- * @param  {string} xpath  The XPath to run
- * @param  {Node} contextNode The start of the XPath
- * @param  {import('./ForeElementMixin.js').default} formElement  The form element associated to the XPath
- * @return {boolean}
- */
 export function evaluateXPathToBoolean(xpath, contextNode, formElement) {
+  const expr0 = String(xpath ?? '').trim();
+
   try {
-    const namespaceResolver = createNamespaceResolverForNode(xpath, contextNode, formElement);
+    const idx = tryResolveIndexExpr(expr0, formElement);
+    if (idx !== null) return Boolean(idx);
+
+    if (_isJsonNode(contextNode) && expr0 === '.') {
+      return true;
+    }
+
+    // ------------------------------------------------------------
+    // JSON CONTEXT
+    // ------------------------------------------------------------
+    if (_isJsonNode(contextNode)) {
+      // 1) Star predicate (repeat filtering style): ?movies?*[ ... ]
+      if (_looksLikeLookupExpr(expr0)) {
+        const sp = _splitStarPredicate(expr0);
+        if (sp) {
+          const baseResolved = _resolveSimpleLookupToJsonNode(sp.base, contextNode, formElement);
+          const baseNodes = Array.isArray(baseResolved)
+            ? baseResolved
+            : baseResolved
+              ? [baseResolved]
+              : [];
+          return _filterJsonNodesByPredicate(baseNodes, sp.predicate, formElement).length > 0;
+        }
+
+        // 2) Simple navigation lookup: ?title, instance('data')?ui?query, etc.
+        if (_isSimpleLookupExpr(expr0)) {
+          const resolved = _resolveSimpleLookupToJsonNode(expr0, contextNode, formElement);
+          if (!resolved) return false;
+          const node = Array.isArray(resolved) ? resolved[0] : resolved;
+          return Boolean(_isJsonNode(node) ? node.value : node);
+        }
+
+        // 3) ✅ Complex expressions containing lookup operator, e.g.
+        //    contains(?title, instance('data')?ui?query)
+        //
+        // Important: XPath 3.1 lookup operator works on map(*) / array(*) items.
+        // A JSON lens node is not a map(*) to the XPath engine.
+        // So evaluate against the RAW JS value of the current JSON node.
+        // Also enable jsonMode:'raw' so instance('data') returns raw JS root without recursion.
+        const rawContext =
+          typeof contextNode.getValue === 'function' ? contextNode.getValue() : contextNode.value;
+
+        const variablesInScope = getVariablesInScope(formElement);
+
+        return fxEvaluateXPathToBoolean(expr0, rawContext, null, variablesInScope, {
+          currentContext: { formElement, jsonMode: 'raw' },
+          functionNameResolver,
+          moduleImports: { xf: XFORMS_NAMESPACE_URI },
+          namespaceResolver: null,
+          language: Language.XPATH_3_1_LANGUAGE,
+          xmlSerializer: new XMLSerializer(),
+        });
+      }
+
+      // 4) Non-lookup XPath in JSON context: evaluate via JSONDomFacade
+      const variablesInScope = getVariablesInScope(formElement);
+      return fxEvaluateXPathToBoolean(expr0, contextNode, __jsonDomFacade, variablesInScope, {
+        currentContext: { formElement },
+        functionNameResolver,
+        moduleImports: { xf: XFORMS_NAMESPACE_URI },
+        namespaceResolver: null,
+        language: Language.XPATH_3_1_LANGUAGE,
+        xmlSerializer: new XMLSerializer(),
+      });
+    }
+
+    // ------------------------------------------------------------
+    // XML / normal evaluation
+    // ------------------------------------------------------------
+    const namespaceResolver = createNamespaceResolverForNode(expr0, contextNode, formElement);
     const variablesInScope = getVariablesInScope(formElement);
 
-    return fxEvaluateXPathToBoolean(xpath, contextNode, null, variablesInScope, {
+    return fxEvaluateXPathToBoolean(expr0, contextNode, null, variablesInScope, {
       currentContext: { formElement },
       functionNameResolver,
-      moduleImports: {
-        xf: XFORMS_NAMESPACE_URI,
-      },
+      moduleImports: { xf: XFORMS_NAMESPACE_URI },
       namespaceResolver,
+      language: Language.XPATH_3_1_LANGUAGE,
+      xmlSerializer: new XMLSerializer(),
     });
   } catch (e) {
-    formElement.dispatchEvent(
+    formElement?.dispatchEvent?.(
       new CustomEvent('error', {
         composed: false,
         bubbles: true,
@@ -643,35 +1322,90 @@ export function evaluateXPathToBoolean(xpath, contextNode, formElement) {
         },
       }),
     );
+    return false;
   }
 }
-
-/**
- * Evaluate an XPath to a string
- *
- * @param  {string}     xpath             The XPath to run
- * @param  {Node}       contextNode       The start of the XPath
- * @param  {Node}       formElement       The form element associated to the XPath
- * @param  {Node}       formElement       The element where the XPath is defined: used for namespace resolving
- * @param  {import('fontoxpath').IDomFacade}  [domFacade=null]  A DomFacade is used in bindings to intercept DOM
- * access. This is used to determine dependencies between bind elements.
- * @return {string}
- */
 export function evaluateXPathToString(xpath, contextNode, formElement, domFacade = null) {
+  const expr0 = String(xpath ?? '').trim();
+
+  const stringify = v => {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+    if (v?.nodeType) {
+      if (v.nodeType === Node.ATTRIBUTE_NODE) return String(v.nodeValue ?? '');
+      return String(v.textContent ?? '');
+    }
+    if (_isJsonNode(v)) {
+      const vv = v.value;
+      if (vv === null || vv === undefined) return '';
+      if (typeof vv === 'string' || typeof vv === 'number' || typeof vv === 'boolean')
+        return String(vv);
+      try {
+        return JSON.stringify(vv);
+      } catch (_e) {
+        return '';
+      }
+    }
+    try {
+      return JSON.stringify(v);
+    } catch (_e) {
+      return '';
+    }
+  };
+
   try {
-    const namespaceResolver = createNamespaceResolverForNode(xpath, contextNode, formElement);
+    const idx = tryResolveIndexExpr(expr0, formElement);
+    if (idx !== null) return String(idx);
+
+    if (_isJsonNode(contextNode) && expr0 === '.') {
+      return stringify(contextNode);
+    }
+
+    if (_isJsonNode(contextNode) && !_looksLikeLookupExpr(expr0)) {
+      const variablesInScope = getVariablesInScope(formElement);
+      const res = fxEvaluateXPathToString(expr0, contextNode, __jsonDomFacade, variablesInScope, {
+        currentContext: { formElement },
+        functionNameResolver,
+        moduleImports: { xf: XFORMS_NAMESPACE_URI },
+        namespaceResolver: null,
+        language: Language.XPATH_3_1_LANGUAGE,
+        xmlSerializer: new XMLSerializer(),
+      });
+      return stringify(res);
+    }
+
+    if (_looksLikeLookupExpr(expr0)) {
+      const relativeJson = _isRelativeJsonLookup(expr0, contextNode);
+      const instanceId = relativeJson ? null : _getInstanceIdForLookupExpr(expr0, formElement);
+      const instance = relativeJson ? null : _getInstanceFromFormElement(formElement, instanceId);
+
+      if (relativeJson || _isJsonInstance(instance)) {
+        if (_isSimpleLookupExpr(expr0)) {
+          const resolved = _resolveSimpleLookupToJsonNode(expr0, contextNode, formElement);
+          if (!resolved) return '';
+          const node = Array.isArray(resolved) ? resolved[0] : resolved;
+          return stringify(node);
+        }
+        // for now, keep string conversions conservative
+        return '';
+      }
+    }
+
+    const namespaceResolver = createNamespaceResolverForNode(expr0, contextNode, formElement);
     const variablesInScope = getVariablesInScope(formElement);
 
-    return fxEvaluateXPathToString(xpath, contextNode, domFacade, variablesInScope, {
+    const res = fxEvaluateXPathToString(expr0, contextNode, domFacade, variablesInScope, {
       currentContext: { formElement },
       functionNameResolver,
-      moduleImports: {
-        xf: XFORMS_NAMESPACE_URI,
-      },
+      moduleImports: { xf: XFORMS_NAMESPACE_URI },
       namespaceResolver,
+      language: Language.XPATH_3_1_LANGUAGE,
+      xmlSerializer: new XMLSerializer(),
     });
+
+    return stringify(res);
   } catch (e) {
-    formElement.dispatchEvent(
+    formElement?.dispatchEvent?.(
       new CustomEvent('error', {
         composed: false,
         bubbles: true,
@@ -683,39 +1417,96 @@ export function evaluateXPathToString(xpath, contextNode, formElement, domFacade
         },
       }),
     );
+    return '';
   }
 }
 
-/**
- * Evaluate an XPath to a set of strings
- *
- * @param  {string}     xpath             The XPath to run
- * @param  {Node}       contextNode       The start of the XPath
- * @param  {Node}       formElement       The form element associated to the XPath
- * @param  {Node}       formElement       The element where the XPath is defined: used for namespace resolving
- * @param  {import('fontoxpath').IDomFacade}  [domFacade=null]  A DomFacade is used in bindings to intercept DOM
- * access. This is used to determine dependencies between bind elements.
- * @return {string[]}
- */
 export function evaluateXPathToStrings(xpath, contextNode, formElement, domFacade = null) {
+  const expr0 = String(xpath ?? '').trim();
+
+  const stringify = v => {
+    if (v === null || v === undefined) return '';
+    if (
+      typeof v === 'string' ||
+      typeof v === 'number' ||
+      typeof v === 'boolean' ||
+      typeof v === 'bigint'
+    )
+      return String(v);
+    if (v?.nodeType) {
+      if (v.nodeType === Node.ATTRIBUTE_NODE) return String(v.nodeValue ?? '');
+      return String(v.textContent ?? '');
+    }
+    if (_isJsonNode(v)) return stringify(v.value);
+    try {
+      return JSON.stringify(v);
+    } catch (_e) {
+      return '';
+    }
+  };
+
   try {
-    const namespaceResolver = createNamespaceResolverForNode(xpath, contextNode, formElement);
-    return fxEvaluateXPathToStrings(
-      xpath,
+    const idx = tryResolveIndexExpr(expr0, formElement);
+    if (idx !== null) return [String(idx)];
+
+    if (_isJsonNode(contextNode) && expr0 === '.') {
+      return [stringify(contextNode)];
+    }
+
+    if (_isJsonNode(contextNode) && !_looksLikeLookupExpr(expr0)) {
+      const res = fxEvaluateXPathToStrings(
+        expr0,
+        contextNode,
+        __jsonDomFacade,
+        getVariablesInScope(formElement),
+        {
+          currentContext: { formElement },
+          functionNameResolver,
+          moduleImports: { xf: XFORMS_NAMESPACE_URI },
+          namespaceResolver: null,
+          language: Language.XPATH_3_1_LANGUAGE,
+          xmlSerializer: new XMLSerializer(),
+        },
+      );
+      return Array.isArray(res) ? res.map(stringify) : [stringify(res)];
+    }
+
+    if (_looksLikeLookupExpr(expr0)) {
+      const relativeJson = _isRelativeJsonLookup(expr0, contextNode);
+      const instanceId = relativeJson ? null : _getInstanceIdForLookupExpr(expr0, formElement);
+      const instance = relativeJson ? null : _getInstanceFromFormElement(formElement, instanceId);
+
+      if (relativeJson || _isJsonInstance(instance)) {
+        if (_isSimpleLookupExpr(expr0)) {
+          const resolved = _resolveSimpleLookupToJsonNode(expr0, contextNode, formElement);
+          if (!resolved) return [];
+          const arr = Array.isArray(resolved) ? resolved : [resolved];
+          return arr.map(stringify);
+        }
+        return [];
+      }
+    }
+
+    const namespaceResolver = createNamespaceResolverForNode(expr0, contextNode, formElement);
+
+    const res = fxEvaluateXPathToStrings(
+      expr0,
       contextNode,
       domFacade,
       {},
       {
         currentContext: { formElement },
         functionNameResolver,
-        moduleImports: {
-          xf: XFORMS_NAMESPACE_URI,
-        },
+        moduleImports: { xf: XFORMS_NAMESPACE_URI },
         namespaceResolver,
+        language: Language.XPATH_3_1_LANGUAGE,
+        xmlSerializer: new XMLSerializer(),
       },
     );
+
+    return Array.isArray(res) ? res.map(stringify) : [stringify(res)];
   } catch (e) {
-    formElement.dispatchEvent(
+    formElement?.dispatchEvent?.(
       new CustomEvent('error', {
         composed: false,
         bubbles: true,
@@ -727,35 +1518,59 @@ export function evaluateXPathToStrings(xpath, contextNode, formElement, domFacad
         },
       }),
     );
+    return [];
   }
 }
 
-/**
- * Evaluate an XPath to a number
- *
- * @param  {string}     xpath             The XPath to run
- * @param  {Node}       contextNode       The start of the XPath
- * @param  {Node}       formElement       The form element associated to the XPath
- * @param  {Node}       formElement       The element where the XPath is defined: used for namespace resolving
- * @param  {import('fontoxpath').IDomFacade}  [domFacade=null]  A DomFacade is used in bindings to intercept DOM
- * access. This is used to determine dependencies between bind elements.
- * @return {number}
- */
 export function evaluateXPathToNumber(xpath, contextNode, formElement, domFacade = null) {
+  const expr0 = String(xpath ?? '').trim();
+
   try {
-    const namespaceResolver = createNamespaceResolverForNode(xpath, contextNode, formElement);
+    const idx = tryResolveIndexExpr(expr0, formElement);
+    if (idx !== null) return idx;
+
+    if (_isJsonNode(contextNode) && expr0 === '.') {
+      const s = String(contextNode?.value ?? '');
+      const n = Number(s);
+      return Number.isFinite(n) ? n : NaN;
+    }
+
+    if (_isJsonNode(contextNode) && !_looksLikeLookupExpr(expr0)) {
+      const variablesInScope = getVariablesInScope(formElement);
+      return fxEvaluateXPathToNumber(expr0, contextNode, __jsonDomFacade, variablesInScope, {
+        currentContext: { formElement },
+        functionNameResolver,
+        moduleImports: { xf: XFORMS_NAMESPACE_URI },
+        namespaceResolver: null,
+        language: Language.XPATH_3_1_LANGUAGE,
+        xmlSerializer: new XMLSerializer(),
+      });
+    }
+
+    if (_looksLikeLookupExpr(expr0)) {
+      const relativeJson = _isRelativeJsonLookup(expr0, contextNode);
+      const instanceId = relativeJson ? null : _getInstanceIdForLookupExpr(expr0, formElement);
+      const instance = relativeJson ? null : _getInstanceFromFormElement(formElement, instanceId);
+
+      if (relativeJson || _isJsonInstance(instance)) {
+        // numbers for JSON are not a priority for now; keep conservative
+        return NaN;
+      }
+    }
+
+    const namespaceResolver = createNamespaceResolverForNode(expr0, contextNode, formElement);
     const variablesInScope = getVariablesInScope(formElement);
 
-    return fxEvaluateXPathToNumber(xpath, contextNode, domFacade, variablesInScope, {
+    return fxEvaluateXPathToNumber(expr0, contextNode, domFacade, variablesInScope, {
       currentContext: { formElement },
       functionNameResolver,
-      moduleImports: {
-        xf: XFORMS_NAMESPACE_URI,
-      },
+      moduleImports: { xf: XFORMS_NAMESPACE_URI },
       namespaceResolver,
+      language: Language.XPATH_3_1_LANGUAGE,
+      xmlSerializer: new XMLSerializer(),
     });
   } catch (e) {
-    formElement.dispatchEvent(
+    formElement?.dispatchEvent?.(
       new CustomEvent('error', {
         composed: false,
         bubbles: true,
@@ -767,74 +1582,60 @@ export function evaluateXPathToNumber(xpath, contextNode, formElement, domFacade
         },
       }),
     );
+    return NaN;
   }
 }
 
+// ------------------------------------------------------------
+// Custom functions (XForms/Fore)
+// ------------------------------------------------------------
+
+// context()
 const contextFunction = (dynamicContext, string) => {
   const caller = dynamicContext.currentContext.formElement;
-  let instance = null;
-  if (string) {
-    instance = resolveId(string, caller);
-  } else {
-    instance = XPathUtil.getParentBindingElement(caller);
-  }
-  if (instance) {
-    if (instance.nodeName === 'FX-REPEAT') {
-      const { nodeset } = instance;
+  let instanceEl = null;
+  if (string) instanceEl = resolveId(string, caller);
+  else instanceEl = XPathUtil.getParentBindingElement(caller);
+
+  if (instanceEl) {
+    if (instanceEl.nodeName === 'FX-REPEAT') {
+      const { nodeset } = instanceEl;
       for (let parent = caller; parent; parent = parent.parentNode) {
-        if (parent.parentNode === instance) {
+        if (parent.parentNode === instanceEl) {
           const offset = Array.from(parent.parentNode.children).indexOf(parent);
           return nodeset[offset];
         }
       }
     }
-    return instance.nodeset;
+    return instanceEl.nodeset;
   }
 
   return caller.getInScopeContext();
 };
 
-// todo: implement
-const currentFunction = (dynamicContext, string) => {
-  const caller = dynamicContext.currentContext.formElement;
-  return null;
-};
+// current() - todo
+const currentFunction = (_dynamicContext, _string) => null;
 
-const elementFunction = (dynamicContext, string) => {
-  const caller = dynamicContext.currentContext.formElement;
-  const newElement = document.createElement(string);
-  return newElement;
-};
+const elementFunction = (_dynamicContext, string) => document.createElement(string);
 
-/**
- * @param id as string
- * @return instance data for given id serialized to string.
- */
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'context' },
   [],
   'item()?',
   contextFunction,
 );
-
-/**
- * @param id as string
- * @return instance data for given id serialized to string.
- */
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'context' },
   ['xs:string'],
   'item()?',
   contextFunction,
 );
-
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'current' },
   ['xs:string'],
   'item()?',
   currentFunction,
 );
-
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'element' },
   ['xs:string'],
@@ -842,29 +1643,25 @@ registerCustomXPathFunction(
   elementFunction,
 );
 
-/**
- * @param id as string
- * @return instance data for given id serialized to string.
- */
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'log' },
   ['xs:string?'],
   'xs:string?',
   (dynamicContext, string) => {
     const { formElement } = dynamicContext.currentContext;
-    const instance = resolveId(string, formElement, 'fx-instance');
-    if (instance) {
-      if (instance.getAttribute('type') === 'json') {
+    const instanceEl = resolveId(string, formElement, 'fx-instance');
+    if (instanceEl) {
+      if (instanceEl.getAttribute('type') === 'json') {
         console.warn('log() does not work for JSON yet');
-        // return JSON.stringify(instance.getDefaultContext());
-      } else {
-        const def = new XMLSerializer().serializeToString(instance.getDefaultContext());
-        return prettifyXml(def);
+        return JSON.stringify(instanceEl.getDefaultContext());
       }
+      const def = new XMLSerializer().serializeToString(instanceEl.getDefaultContext());
+      return prettifyXml(def);
     }
     return null;
   },
 );
+
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'fore-attr' },
   ['xs:string?'],
@@ -873,13 +1670,10 @@ registerCustomXPathFunction(
     const { formElement } = dynamicContext.currentContext;
 
     let parent = formElement;
-    if (formElement.nodeType === Node.TEXT_NODE) {
-      parent = formElement.parentNode;
-    }
+    if (formElement.nodeType === Node.TEXT_NODE) parent = formElement.parentNode;
+
     const foreElement = parent.closest('fx-fore');
-    if (foreElement.hasAttribute(string)) {
-      return foreElement.getAttribute(string);
-    }
+    if (foreElement.hasAttribute(string)) return foreElement.getAttribute(string);
     return null;
   },
 );
@@ -891,79 +1685,45 @@ registerCustomXPathFunction(
   (_dynamicContext, string) => {
     const parser = new DOMParser();
     const out = parser.parseFromString(string, 'application/xml');
-    console.log('parse', out);
-
-    /*
-                const {formElement} = dynamicContext.currentContext;
-                const instance = resolveId(string, formElement, 'fx-instance');
-                if (instance) {
-                    if (instance.getAttribute('type') === 'json') {
-                        console.warn('log() does not work for JSON yet');
-                        // return JSON.stringify(instance.getDefaultContext());
-                    } else {
-                        const def = new XMLSerializer().serializeToString(instance.getDefaultContext());
-                        return Fore.prettifyXml(def);
-                    }
-                }
-        */
     return out.firstElementChild;
   },
 );
 
 function buildTree(tree, data) {
   if (!data) return;
-  if (data.nodeType === Node.ELEMENT_NODE) {
-    if (data.children) {
-      const details = document.createElement('details');
-      details.setAttribute('data-path', data.nodeName);
-      const summary = document.createElement('summary');
+  if (data.nodeType !== Node.ELEMENT_NODE) return;
 
-      let display = ` <${data.nodeName}`;
-      Array.from(data.attributes).forEach(attr => {
-        display += ` ${attr.nodeName}="${attr.nodeValue}"`;
-      });
+  const details = document.createElement('details');
+  details.setAttribute('data-path', data.nodeName);
+  const summary = document.createElement('summary');
 
-      let contents;
-      if (
-        data.firstChild &&
-        data.firstChild.nodeType === Node.TEXT_NODE &&
-        data.firstChild.data.trim() !== ''
-      ) {
-        // console.log('whoooooooooopp');
-        contents = data.firstChild.nodeValue;
-        display += `>${contents}</${data.nodeName}>`;
-      } else {
-        display += '>';
-      }
-      summary.textContent = display;
+  let display = ` <${data.nodeName}`;
+  Array.from(data.attributes).forEach(attr => {
+    display += ` ${attr.nodeName}="${attr.nodeValue}"`;
+  });
 
-      details.appendChild(summary);
-      if (data.childElementCount !== 0) {
-        details.setAttribute('open', 'open');
-      } else {
-        summary.setAttribute('style', 'list-style:none;');
-      }
-      tree.appendChild(details);
+  if (
+    data.firstChild &&
+    data.firstChild.nodeType === Node.TEXT_NODE &&
+    data.firstChild.data.trim() !== ''
+  ) {
+    const contents = data.firstChild.nodeValue;
+    display += `>${contents}</${data.nodeName}>`;
+  } else {
+    display += '>';
+  }
 
-      Array.from(data.children).forEach(child => {
-        // if(child.nodeType === Node.ELEMENT_NODE){
-        // child.parentNode.appendChild(buildTree(child));
-        buildTree(details, child);
-        // }
-      });
-    }
-  } /* else if(data.nodeType === Node.ATTRIBUTE_NODE){
-        //create span for now
-        // const span = document.createElement('span');
-        // span.style.background = 'grey';
-        // span.textContent = data.value;
-        // tree.appendChild(span);
-        tree.setAttribute(data.nodeName,data.value);
-    }else {
-        tree.textContent = data;
-    } */
+  summary.textContent = display;
+  details.appendChild(summary);
 
-  // return tree;
+  if (data.childElementCount !== 0) {
+    details.setAttribute('open', 'open');
+    Array.from(data.children).forEach(child => buildTree(details, child));
+  } else {
+    summary.setAttribute('style', 'list-style:none;');
+  }
+
+  tree.appendChild(details);
 }
 
 registerCustomXPathFunction(
@@ -972,71 +1732,90 @@ registerCustomXPathFunction(
   'element()?',
   (dynamicContext, string) => {
     const { formElement } = dynamicContext.currentContext;
-    const instance = resolveId(string, formElement, 'fx-instance');
+    const instanceEl = resolveId(string, formElement, 'fx-instance');
+    if (!instanceEl) return null;
 
-    if (instance) {
-      // const def = new XMLSerializer().serializeToString(instance.getDefaultContext());
-      // const def = JSON.stringify(instance.getDefaultContext());
+    const treeDiv = document.createElement('div');
+    treeDiv.setAttribute('class', 'logtree');
 
-      const treeDiv = document.createElement('div');
-      treeDiv.setAttribute('class', 'logtree');
-      // const datatree = buildTree(tree,instance.getDefaultContext());
-      // return tree.appendChild(datatree);
-      // return  buildTree(root,instance.getDefaultContext());;
-      const form = dynamicContext.currentContext.formElement;
-      const logtree = form.querySelector('.logtree');
-      if (logtree) {
-        logtree.parentNode.removeChild(logtree);
-      }
-      const tree = buildTree(treeDiv, instance.getDefaultContext());
-      if (tree) {
-        form.appendChild(tree);
-      }
-    }
+    const form = dynamicContext.currentContext.formElement;
+    const logtree = form.querySelector('.logtree');
+    if (logtree) logtree.parentNode.removeChild(logtree);
+
+    buildTree(treeDiv, instanceEl.getDefaultContext());
+    form.appendChild(treeDiv);
+
     return null;
   },
 );
 
+// instance() — supports RAW JSON mode for predicates/filters
 const instance = (dynamicContext, string) => {
-  // Spec: https://www.w3.org/TR/xforms-xpath/#The_XForms_Function_Library#The_instance.28.29_Function
-  // TODO: handle no string passed (null will be passed instead)
+  let caller = dynamicContext?.currentContext?.formElement || null;
+  if (caller && caller.nodeType === Node.TEXT_NODE) caller = caller.parentNode;
 
-  /**
-   * @type {import('./fx-fore.js').FxFore}
-   */
-  const formElement = fxEvaluateXPathToFirstNode(
-    'ancestor-or-self::fx-fore[1]',
-    dynamicContext.currentContext.formElement,
-    null,
-    null,
-    { namespaceResolver: xhtmlNamespaceResolver },
-  );
+  const fore =
+    (caller && typeof caller.getOwnerForm === 'function' && caller.getOwnerForm()) ||
+    _getOwningFore(caller) ||
+    null;
 
-  let lookup = null;
-  if (string === null || string === 'default') {
-    lookup = formElement.getModel().getDefaultInstance();
-  } else {
-    lookup = formElement.getModel().getInstance(string);
-    if (!lookup) {
-      document.querySelector('fx-fore').dispatchEvent(
-        new CustomEvent('error', {
-          composed: true,
-          bubbles: true,
-          detail: {
-            origin: 'functions',
-            message: `Instance not found '${string}'`,
-            level: 'Error',
-          },
-        }),
-      );
+  if (!fore) return null;
+
+  const modelEl =
+    (typeof fore.getModel === 'function' && fore.getModel()) ||
+    fore.shadowRoot?.querySelector?.('fx-model') ||
+    fore.querySelector?.('fx-model') ||
+    null;
+
+  if (!modelEl) return null;
+
+  const id =
+    string === null || string === undefined || String(string).trim() === ''
+      ? 'default'
+      : String(string);
+
+  let instEl = typeof modelEl.getInstance === 'function' ? modelEl.getInstance(id) : null;
+
+  if (!instEl) {
+    if (id === 'default') {
+      instEl =
+        modelEl.querySelector?.('fx-instance:not([id])') ||
+        modelEl.querySelector?.("fx-instance[id='default']") ||
+        modelEl.querySelector?.('fx-instance') ||
+        null;
+    } else {
+      instEl =
+        resolveId(id, caller, 'fx-instance') ||
+        modelEl.querySelector?.(`#${CSS.escape(id)}`) ||
+        modelEl.querySelector?.(`fx-instance[id="${id}"]`) ||
+        null;
     }
   }
 
-  const context = lookup.getDefaultContext();
-  if (!context) {
-    return null;
+  if (!instEl) return null;
+
+  const type =
+    (typeof instEl.getAttribute === 'function' && instEl.getAttribute('type')) || instEl.type || '';
+  const isJson = type === 'json';
+
+  // RAW JSON mode: return raw JS root (maps/arrays)
+  if (dynamicContext?.currentContext?.jsonMode === 'raw' && isJson) {
+    return _getRawJsonRootValue(instEl);
   }
-  return context;
+
+  // Normal mode:
+  if (isJson)
+    return (
+      instEl.nodeset ||
+      (typeof instEl.getDefaultContext === 'function' ? instEl.getDefaultContext() : null) ||
+      null
+    );
+
+  return (
+    (typeof instEl.getDefaultContext === 'function' ? instEl.getDefaultContext() : null) ||
+    instEl.nodeset ||
+    null
+  );
 };
 
 registerCustomXPathFunction(
@@ -1045,28 +1824,28 @@ registerCustomXPathFunction(
   'xs:integer?',
   (dynamicContext, string) => {
     const { formElement } = dynamicContext.currentContext;
-    if (string === null) {
-      return 1;
-    }
-    const repeat = resolveId(string, formElement, 'fx-repeat');
 
-    // const def = instance.getInstanceData();
-    if (repeat) {
-      return repeat.getAttribute('index');
-    }
-    return Number(1);
+    if (string === null) return 1;
+    const repeat = resolveId(string, formElement, 'fx-repeat');
+    if (!repeat) return 1;
+
+    const attr = repeat.getAttribute('index');
+    const attrNum = Number(attr);
+    if (Number.isFinite(attrNum) && attrNum > 0) return attrNum;
+
+    const propNum = Number(repeat.index);
+    if (Number.isFinite(propNum) && propNum > 0) return propNum;
+
+    return 1;
   },
 );
 
-// Note that this is not to spec. The spec enforces elements to be returned from the
-// instance. However, we allow instances to actually be JSON!
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'instance' },
   [],
   'item()?',
-  domFacade => instance(domFacade, null),
+  dynamicContext => instance(dynamicContext, null),
 );
-
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'instance' },
   ['xs:string?'],
@@ -1074,124 +1853,11 @@ registerCustomXPathFunction(
   instance,
 );
 
-const jsonToXml = (_dynamicContext, json) => {
-  const escapeXml = str =>
-    str.replace(
-      /[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD]/g,
-      char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`,
-    );
-
-  const convert = (obj, parent) => {
-    const type = typeof obj;
-    if (type === 'number') {
-      parent.setAttribute('type', 'number');
-      parent.textContent = obj.toString();
-    } else if (type === 'boolean') {
-      parent.setAttribute('type', 'boolean');
-      parent.textContent = obj.toString();
-    } else if (obj === null) {
-      const node = document.createElement('_');
-      node.setAttribute('type', 'null');
-      parent.appendChild(node);
-    } else if (type === 'string') {
-      parent.textContent = escapeXml(obj);
-    } else if (Array.isArray(obj)) {
-      parent.setAttribute('type', 'array');
-      obj.forEach(item => {
-        const node = document.createElement('_');
-        convert(item, node);
-        node.textContent = item;
-        parent.appendChild(node);
-      });
-    } else if (type === 'object') {
-      parent.setAttribute('type', 'object');
-      Object.entries(obj).forEach(([key, value]) => {
-        if (value) {
-          const childNode = document.createElement(key.replace(/[^a-zA-Z0-9_]/g, '_'));
-          convert(value, childNode);
-          parent.appendChild(childNode);
-        }
-      });
-    }
-  };
-
-  const root = document.createElement('json');
-  if (Array.isArray(json)) {
-    root.setAttribute('type', 'array');
-  } else {
-    root.setAttribute('type', 'object');
-  }
-  convert(json, root);
-  // return root.outerHTML;
-  console.log('xml', root);
-  return root;
-};
-
-registerCustomXPathFunction(
-  { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'json2xml' },
-  ['item()?'],
-  'item()?',
-  jsonToXml,
-);
-const xmlToJson = (_dynamicContext, xml) => {
-  const isElementNode = node => node.nodeType === Node.ELEMENT_NODE;
-
-  const isTextNode = node => node.nodeType === Node.TEXT_NODE;
-
-  const parseNode = node => {
-    if (isElementNode(node)) {
-      const obj = {};
-      if (node.hasAttributes()) {
-        obj.type = node.getAttribute('type');
-      }
-      if (node.childNodes.length === 1 && isTextNode(node.firstChild)) {
-        return node.textContent;
-      }
-      for (const child of node.childNodes) {
-        const childName = child.nodeName;
-        const childValue = parseNode(child);
-        if (obj[childName]) {
-          if (!Array.isArray(obj[childName])) {
-            obj[childName] = [obj[childName]];
-          }
-          obj[childName].push(childValue);
-        } else {
-          obj[childName] = childValue;
-        }
-      }
-      return obj;
-    }
-    if (isTextNode(node)) {
-      return node.textContent;
-    }
-    return undefined;
-  };
-
-  const parser = new DOMParser();
-  const xmlDoc = parser.parseFromString(xml, 'application/xml');
-  const root = xmlDoc.documentElement;
-  return parseNode(root);
-};
-registerCustomXPathFunction(
-  { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'xmltoJson' },
-  ['item()?'],
-  'item()?',
-  xmlToJson,
-);
-
-/*
-// Example usage:
-const xml = '<json type="object"><given>Mark</given><family>Smith</family></json>';
-console.log(xmlToJson(xml));
-*/
-
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'depends' },
   ['node()*'],
   'item()?',
-  (_dynamicContext, nodes) =>
-    // console.log('depends on : ', nodes[0]);
-    nodes[0],
+  (_dynamicContext, nodes) => nodes[0],
 );
 
 registerCustomXPathFunction(
@@ -1206,13 +1872,8 @@ registerCustomXPathFunction(
       ancestor;
       ancestor = ancestor.parentNode
     ) {
-      if (!ancestor.currentEvent) {
-        continue;
-      }
+      if (!ancestor.currentEvent) continue;
 
-      // We have a current event. read the property either from detail, or from the event
-      // itself.
-      // Check detail for custom events! This is how that is passed along
       if (
         ancestor.currentEvent.detail &&
         typeof ancestor.currentEvent.detail === 'object' &&
@@ -1221,108 +1882,76 @@ registerCustomXPathFunction(
         return ancestor.currentEvent.detail[arg];
       }
 
-      // arg might be `code`, so currentEvent.code should work
-      if (arg.includes('.')) {
-        return _propertyLookup(ancestor.currentEvent, arg);
-      }
+      if (arg.includes('.')) return _propertyLookup(ancestor.currentEvent, arg);
+
       return ancestor.currentEvent[arg] || null;
     }
+
     return null;
   },
 );
 
 function _propertyLookup(obj, path) {
   const parts = path.split('.');
-  if (parts.length == 1) {
-    return obj[parts[0]];
-  }
+  if (parts.length === 1) return obj[parts[0]];
   return _propertyLookup(obj[parts[0]], parts.slice(1).join('.'));
 }
 
-// Implement the XForms standard functions here.
 registerXQueryModule(`
-    module namespace xf="${XFORMS_NAMESPACE_URI}";
+  module namespace xf="${XFORMS_NAMESPACE_URI}";
 
-    declare %public function xf:boolean-from-string($str as xs:string) as xs:boolean {
-        lower-case($str) = "true" or $str = "1"
-    };
+  declare %public function xf:boolean-from-string($str as xs:string) as xs:boolean {
+      lower-case($str) = "true" or $str = "1"
+  };
 `);
 
-// How to run XQUERY:
-/**
- registerXQueryModule(`
- module namespace my-custom-namespace = "my-custom-uri";
- (:~
- Insert attribute somewhere
- ~:)
- declare %public %updating function my-custom-namespace:do-something ($ele as element()) as xs:boolean {
-	if ($ele/@done) then false() else
-	(insert node
-	attribute done {"true"}
-	into $ele, true())
-};
- `)
- // At some point:
- const contextNode = null;
- const pendingUpdatesAndXdmValue = evaluateUpdatingExpressionSync('ns:do-something(.)', contextNode, null, null, {moduleImports: {'ns': 'my-custom-uri'}})
-
- console.log(pendingUpdatesAndXdmValue.xdmValue); // this is true or false, see function
-
- executePendingUpdateList(pendingUpdatesAndXdmValue.pendingUpdateList, null, null, null);
- */
-
-/**
- * @param input as string
- * @return {string}
- */
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'base64encode' },
   ['xs:string?'],
   'xs:string?',
   (_dynamicContext, string) => btoa(string),
 );
-
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'local-date' },
   [],
   'xs:string?',
-  (_dynamicContext, _string) => new Date().toLocaleDateString(),
+  () => new Date().toLocaleDateString(),
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'local-dateTime' },
   [],
   'xs:string?',
-  (_dynamicContext, _string) => new Date().toLocaleString(),
+  () => new Date().toLocaleString(),
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri' },
   [],
   'xs:string?',
-  (_dynamicContext, _string) => window.location.href,
+  () => window.location.href,
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-fragment' },
   [],
   'xs:string?',
-  (_dynamicContext, _arg) => window.location.hash,
+  () => window.location.hash,
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-host' },
   [],
   'xs:string?',
-  (_dynamicContext, _arg) => window.location.host,
+  () => window.location.host,
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-query' },
   [],
   'xs:string?',
-  (_dynamicContext, _arg) => window.location.search,
+  () => window.location.search,
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-relpath' },
   [],
   'xs:string?',
-  (_dynamicContext, _arg) => {
+  () => {
     const path = new URL(window.location.href).pathname;
     return path.substring(0, path.lastIndexOf('/') + 1);
   },
@@ -1331,13 +1960,13 @@ registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-path' },
   [],
   'xs:string?',
-  (_dynamicContext, _arg) => new URL(window.location.href).pathname,
+  () => new URL(window.location.href).pathname,
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-port' },
   [],
   'xs:string?',
-  (_dynamicContext, _arg) => window.location.port,
+  () => window.location.port,
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-param' },
@@ -1345,38 +1974,22 @@ registerCustomXPathFunction(
   'xs:string?',
   (_dynamicContext, arg) => {
     if (!arg) return null;
-
-    const { search } = window.location;
-    const urlparams = new URLSearchParams(search);
-    const param = urlparams.get(arg);
-    return param || '';
+    const urlparams = new URLSearchParams(window.location.search);
+    return urlparams.get(arg) || '';
   },
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-scheme' },
   [],
   'xs:string?',
-  (_dynamicContext, _arg) => new URL(window.location.href).protocol,
+  () => new URL(window.location.href).protocol,
 );
 registerCustomXPathFunction(
   { namespaceURI: XFORMS_NAMESPACE_URI, localName: 'uri-scheme-specific-part' },
   [],
   'xs:string?',
-  (_dynamicContext, _arg) => {
+  () => {
     const uri = window.location.href;
-    return uri.substring(uri.indexOf(':') + 1, uri.length);
+    return uri.substring(uri.indexOf(':') + 1);
   },
 );
-
-/**
- * @param {Node} node
- * @returns string
- */
-/*
-export static getDocPath(node) {
-  const path = fx.evaluateXPathToString('path()', node);
-  // Path is like `$default/x[1]/y[1]`
-  const shortened = XPathUtil.shortenPath(path);
-  return shortened.startsWith('/') ? `${shortened}` : `/${shortened}`;
-}
-*/

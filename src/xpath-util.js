@@ -23,9 +23,7 @@ export class XPathUtil {
           for (const item of astNode[key]) {
             if (XPathUtil.containsDynamicContent(item)) return true;
           }
-        } else {
-          if (XPathUtil.containsDynamicContent(astNode[key])) return true;
-        }
+        } else if (XPathUtil.containsDynamicContent(astNode[key])) return true;
       }
     }
 
@@ -41,38 +39,99 @@ export class XPathUtil {
    * supports multiple steps
    *
    * @param xpath
-   * @param doc
+   * @param doc {XMLDocument}
    * @param fore
-   * @return {*}
+   * @param namespaceResolver {function} optional namespace resolver function
+   * @return {Node|Attr}
    */
-  static createNodesFromXPath(xpath, doc, fore) {
+  static createNodesFromXPath(xpath, doc, fore, namespaceResolver = null) {
+    const resolveNamespace = namespaceResolver || (() => undefined);
+
     if (!doc) {
       doc = document.implementation.createDocument(null, null, null); // Create a new XML document if not provided
     }
 
-    const parts = xpath.split('/');
+    const parts = [];
+    let scratch = '';
+    let isInPredicate = false;
+    for (const char of xpath.split('')) {
+      if (!isInPredicate) {
+        // We are not in a predicate, the slash will terminate our step.
+        if (char === '/') {
+          parts.push(scratch);
+          scratch = '';
+          continue;
+        }
+
+        scratch += char;
+        if (char === '[') {
+          isInPredicate = true;
+        }
+        continue;
+      }
+      // We are in a predicate! So the only interesting token is ']', which means we're out of one.
+      scratch += char;
+
+      if (char === ']') {
+        isInPredicate = false;
+      }
+    }
+    // Flush the last step
+    parts.push(scratch);
+
     let rootNode = null;
     let currentNode = null;
 
     for (const part of parts) {
       if (!part) continue; // Skip empty parts (e.g., leading slashes)
+      if (part === '.') {
+        // A '.' does not introduce new elements
+        continue;
+      }
 
       // Handle attributes
       if (part.startsWith('@')) {
         const attrName = part.slice(1); // Strip '@'
         if (!currentNode) {
-          throw new Error('Cannot create an attribute without a parent element.');
+          return doc.createAttribute(attrName, '');
         }
         currentNode.setAttribute(attrName, '');
       } else {
+        // We are a predicate selector! Handle it
+        // This regex matches strings like:
+        // - listBibl
+        // - tei:listBibl
+        // - listBibl[@type="foo"]
+        // - listBibl[@type="foo"][@class="bar"]
+        // It will also match strings like
+        // - listBibl[ancestor-or-self::foo]
+        // which will be filtered out later.
+
+        const result = part.match(/^(?<name>[\w:-]+)(?<predicates>(\[[^]*\])*)$/);
+        if (!result) {
+          throw new Error(
+            `No element could be made from the XPath step ${part}. It must be of these forms: 'localName', 'prefix:name', 'name[@attr="value"]' et cetera.`,
+          );
+        }
+        const { name, predicates } = result.groups;
         // Handle namespaces if present
-        const [prefix, localName] = part.includes(':') ? part.split(':') : [null, part];
-        const namespace = prefix ? XPathUtil.lookupNamespace(fore, prefix) : null;
+        const [prefix, localName] = name.includes(':') ? name.split(':') : [null, name];
+        const namespace = resolveNamespace(prefix);
 
         const newElement = namespace
-          ? doc.createElementNS(namespace, part)
+          ? doc.createElementNS(namespace, localName)
           : doc.createElement(localName);
 
+        if (predicates) {
+          const predicateExtractionRegex =
+            /(\[@(?<name>[\w:-]*)\s?=\s?["'](?<value>[^"']*)['"]\])+/g;
+          const parsedPredicates = predicates
+            .matchAll(predicateExtractionRegex)
+            .map(match => ({ attrName: match.groups.name, value: match.groups.value }));
+          for (const { attrName, value } of parsedPredicates) {
+            newElement.setAttribute(attrName, value);
+          }
+        }
         if (!rootNode) {
           rootNode = newElement; // Set as the root node
         } else {
@@ -81,7 +140,6 @@ export class XPathUtil {
         currentNode = newElement;
       }
     }
-
     if (!rootNode) {
       throw new Error('Invalid XPath; no root element could be created.');
     }
@@ -187,19 +245,30 @@ export class XPathUtil {
    * @returns {*|null}
    */
   static getParentBindingElement(start) {
-    /*    if (start.parentNode.host) {
-          const { host } = start.parentNode;
-          if (host.hasAttribute('ref')) {
-            return host;
-          }
-        } else */
-    if (
-      start.parentNode &&
-      (start.parentNode.nodeType !== Node.DOCUMENT_NODE ||
-        start.parentNode.nodeType !== Node.DOCUMENT_FRAGMENT_NODE)
-    ) {
-      return this.getClosest('[ref],fx-repeatitem', start.parentNode);
+    // JSON lens case
+    if (start && start.__jsonlens__ === true) {
+      let current = start.parent;
+      while (current) {
+        if (current.bindingElement) return current.bindingElement;
+        current = current.parent;
+      }
+      return null;
     }
+
+    // DOM case
+    let node = start?.parentNode;
+
+    while (
+      node &&
+      node.nodeType !== Node.DOCUMENT_NODE &&
+      node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE
+    ) {
+      if (node.matches?.('[ref],fx-repeatitem')) {
+        return node;
+      }
+      node = node.parentNode;
+    }
+
     return null;
   }
 
@@ -212,7 +281,7 @@ export class XPathUtil {
    */
   static isAbsolutePath(path) {
     return (
-      path != null && (path.startsWith('/') || path.startsWith('instance(') || path.startsWith('$'))
+      path != null && (path.startsWith('/') || path.startsWith('instance(') || path.startsWith('$') || path.startsWith('?'))
     );
   }
 
@@ -234,19 +303,27 @@ export class XPathUtil {
    * @returns {string}
    */
   static getInstanceId(ref, boundElement) {
-    if (!ref) {
+    const refStr = typeof ref === 'string' ? ref.trim() : '';
+
+    // Explicit "default instance" selector
+    if (refStr.startsWith('instance()')) {
       return 'default';
     }
-    if (ref.startsWith('instance()')) {
-      return 'default';
+
+    // Explicit instance('id') selector at the START of the expression only
+    // (Do NOT use refStr.includes('instance(') because predicates may reference other instances.)
+    {
+      const m = refStr.match(/^instance\(\s*(['"])(?<id>.*?)\1\s*\)/);
+      if (m?.groups?.id != null) {
+        return m.groups.id;
+      }
     }
-    if (ref.startsWith('instance(')) {
-      const result = ref.substring(ref.indexOf('(') + 1);
-      return result.substring(1, result.indexOf(')') - 1);
-    }
-    if (ref.startsWith('$')) {
-      // this variable might actually point to an instance
-      const variableName = ref.match(/\$(?<variableName>[a-zA-Z0-9\-\_]+).*/)?.groups?.variableName;
+
+    // Variable indirection (may ultimately point to instance(...))
+    if (refStr.startsWith('$')) {
+      const variableName = refStr.match(/^\$(?<variableName>[a-zA-Z0-9\-_]+)/)?.groups
+        ?.variableName;
+
       let closestActualFormElement = boundElement;
       while (closestActualFormElement && !('inScopeVariables' in closestActualFormElement)) {
         closestActualFormElement =
@@ -256,12 +333,31 @@ export class XPathUtil {
       }
 
       const correspondingVariable = closestActualFormElement?.inScopeVariables?.get(variableName);
-      if (!correspondingVariable) {
-        return null;
-      }
+      if (!correspondingVariable) return null;
+
       return this.getInstanceId(correspondingVariable.valueQuery, correspondingVariable);
     }
-    return null;
+
+    // If we can't decide from the ref itself (relative paths, '/', '.', missing ref, fx-repeatitem),
+    // inherit from the nearest ancestor that *does* have a ref or explicit instance().
+    const parentBinding = XPathUtil.getParentBindingElement(boundElement);
+    if (parentBinding) {
+      // If this is a repeatitem boundary with no ref, keep climbing
+      if (parentBinding.matches?.('fx-repeatitem') && !parentBinding.getAttribute?.('ref')) {
+        return this.getInstanceId(null, parentBinding);
+      }
+
+      const parentRef = parentBinding.getAttribute?.('ref');
+      if (parentRef) {
+        return this.getInstanceId(parentRef, parentBinding);
+      }
+
+      // Parent binding exists but has no ref (rare, but safe): keep climbing
+      return this.getInstanceId(null, parentBinding);
+    }
+
+    // No parent binding => top of scope. If ref wasn't explicit, default.
+    return 'default';
   }
 
   /**
@@ -297,18 +393,6 @@ export class XPathUtil {
     return shortened.startsWith('/') ? `${shortened}` : `/${shortened}`;
   }
 */
-
-  /**
-   * @param {Node} node
-   * @param {string} instanceId
-   * @returns string
-   */
-  static getPath(node, instanceId) {
-    const path = fx.evaluateXPathToString('path()', node);
-    // Path is like `$default/x[1]/y[1]`
-    const shortened = XPathUtil.shortenPath(path);
-    return shortened.startsWith('/') ? `$${instanceId}${shortened}` : `$${instanceId}/${shortened}`;
-  }
 
   /**
    * @param {string} path

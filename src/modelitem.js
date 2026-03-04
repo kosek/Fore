@@ -20,17 +20,12 @@ export class ModelItem {
   /**
    * @param {string} path - Calculated normalized path expression linking to data
    * @param {string} ref - Relative binding expression
-   * @param {boolean} readonly - Signals readonly/readwrite state
-   * @param {boolean} relevant - Signals relevant/non-relevant state
-   * @param {boolean} required - Signals required/optional state
-   * @param {boolean} constraint - Signals valid/invalid state
-   * @param {string} type - Data type expression
    * @param {Node} node - The node the 'ref' expression is referring to
    * @param {import('./fx-bind').FxBind} bind - The fx-bind element having created this ModelItem
    * @param {string} instance - The fx-instance id having created this ModelItem
    * @param {import('./fx-fore').FxFore} fore - The fx-fore element this ModelItem belongs to
    */
-  constructor(path, ref, node, bind, instance, fore) {
+  constructor(path, ref, nodeOrLens, bind, instance, fore) {
     this.path = path;
     this.ref = ref;
     this.readonly = ModelItem.READONLY_DEFAULT;
@@ -38,7 +33,13 @@ export class ModelItem {
     this.required = ModelItem.REQUIRED_DEFAULT;
     this.constraint = ModelItem.CONSTRAINT_DEFAULT;
     this.type = ModelItem.TYPE_DEFAULT;
-    this.node = node;
+    this.node = null;
+    this.lens = null;
+    if (nodeOrLens?.get && nodeOrLens?.set) {
+      this.lens = nodeOrLens;
+    } else {
+      this.node = nodeOrLens;
+    }
     this.bind = bind;
     this.instanceId = instance;
     this.fore = fore;
@@ -64,6 +65,7 @@ export class ModelItem {
   }
 
   get value() {
+    if (this.lens) return this.lens.get();
     if (!this.node) return null;
     if (!this.node.nodeType) return this.node;
     if (this.node.nodeType === Node.ATTRIBUTE_NODE) {
@@ -73,16 +75,23 @@ export class ModelItem {
   }
 
   set value(newVal) {
+    if (this.lens) {
+      const oldVal = this.lens.get();
+      this.lens.set(newVal);
+      if (oldVal !== newVal) this.notify();
+      return;
+    }
+
     if (!this.node) return;
     const oldVal = this.value;
 
-    if (newVal?.nodeType === Node.DOCUMENT_NODE) {
+    if (newVal?.nodeType && newVal.nodeType === Node.DOCUMENT_NODE) {
       this.node.replaceWith(newVal.firstElementChild);
-      this.node = newVal.firstElementChild;
-    } else if (newVal?.nodeType === Node.ELEMENT_NODE) {
+      // this.node.appendChild(newVal.firstElementChild);
+    } else if (newVal?.nodeType && newVal.nodeType === Node.ELEMENT_NODE) {
       this.node.replaceWith(newVal);
-      this.node = newVal;
-    } else if (this.node.nodeType === Node.ATTRIBUTE_NODE) {
+      // this.node.appendChild(newVal);
+    } else if (newVal?.nodeType && this.node.nodeType === Node.ATTRIBUTE_NODE) {
       this.node.nodeValue = newVal;
     } else {
       this.node.textContent = newVal;
@@ -98,6 +107,7 @@ export class ModelItem {
    * @param {Object} observer - The observer to add
    */
   addObserver(observer) {
+    // console.log('[ModelItem] adding observer:', observer);
     this.observers.add(observer);
 
     // For backward compatibility with boundControls
@@ -129,7 +139,7 @@ export class ModelItem {
    */
   notify() {
     // Only log in debug mode or reduce verbosity to prevent console flooding
-    console.log('[ModelItem] notifying observers for path:', this);
+    // console.log('[ModelItem] notifying observers for path:', this);
 
     // Add to batched notifications. TODO: is the else needed?
     if (this.fore) {

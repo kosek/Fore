@@ -17,7 +17,7 @@ export class Fore {
 
   static REQUIRED_DEFAULT = false;
 
-  static RELEVANT_DEFAULT = true;
+  static RELEVANT_DEFAULT = true
 
   static CONSTRAINT_DEFAULT = true;
 
@@ -230,7 +230,7 @@ export class Fore {
   }
 
   static get UI_ELEMENTS() {
-    return [
+    return new Set([
       'FX-ALERT',
       'FX-CONTROL',
       'FX-DIALOG',
@@ -252,11 +252,7 @@ export class Fore {
       'FX-TRIGGER',
       'FX-UPLOAD',
       'FX-VAR',
-    ];
-  }
-
-  static get MODEL_ELEMENTS() {
-    return ['FX-BIND', 'FX-FUNCTION', 'FX-MODEL', 'FX-INSTANCE', 'FX-SUBMISSION'];
+    ]);
   }
 
   /**
@@ -264,12 +260,13 @@ export class Fore {
    * @returns {boolean}
    */
   static isUiElement(elementName) {
-    const found = Fore.UI_ELEMENTS.includes(elementName);
-    if (found) {
-      // console.log('_isUiElement ', found);
-    }
-    return Fore.UI_ELEMENTS.includes(elementName);
+    return Fore.UI_ELEMENTS.has(elementName);
   }
+
+  static get MODEL_ELEMENTS() {
+    return ['FX-BIND', 'FX-FUNCTION', 'FX-MODEL', 'FX-INSTANCE', 'FX-SUBMISSION'];
+  }
+
 
   static async initUI(startElement) {
     const inited = new Promise(resolve => {
@@ -296,76 +293,39 @@ export class Fore {
    * @returns {Promise<void>}
    */
   static async refreshChildren(startElement, force) {
-    const refreshed = new Promise(resolve => {
-      /*
-      if there's an 'refresh-on-view' attribute the element wants to be handled by
-      handleIntersect function that calls the refresh of the respective element and
-      not the global one.
-       */
-      // if(!force && startElement.hasAttribute('refresh-on-view')) return;
+    const children = startElement?.children ? Array.from(startElement.children) : [];
+    for (const element of children) {
+      // Do not cross into nested fore roots
+      if (element.nodeName.toUpperCase() === 'FX-FORE') {
+        break;
+      }
 
-      /*  ### attempt with querySelectorAll is even slower than iterating recursively
+      if (Fore.isUiElement(element.nodeName) && typeof element.refresh === 'function') {
+        /** @type {import('./ForeElementMixin.js').default} */
+        const bound = element;
 
-      const children = startElement.querySelectorAll('[ref]');
-      Array.from(children).forEach(uiElement => {
-        if (Fore.isUiElement(uiElement.nodeName) && typeof uiElement.refresh === 'function') {
-          uiElement.refresh();
-        }
-      });
-*/
-      const { children } = startElement;
-      if (children) {
-        for (const element of Array.from(children)) {
-          if (element.nodeName.toUpperCase() === 'FX-FORE') {
-            break;
+        // Keep old behavior: only refresh UI elements during full/forced refresh
+        if (!force) {
+          // still recurse below
+        } else if (force === true) {
+          const maybePromise = bound.refresh(force);
+          if (maybePromise && typeof maybePromise.then === 'function') {
+            await maybePromise;
           }
-          if (Fore.isUiElement(element.nodeName) && typeof element.refresh === 'function') {
-            /**
-             * @type {import('./ForeElementMixin.js').default}
-             */
-            const bound = element;
-            if (!force) {
-              continue;
-            }
-            if (force === true) {
-              console.log('🔄 refreshing ', element);
-              // Unconditional force refresh
-              bound.refresh(force);
-
-              continue;
-            }
-            if (typeof force !== 'object') {
-              continue;
-            }
-            if (
-              force.reason === 'index-function' &&
-              bound.dependencies.isInvalidatedByIndexFunction()
-            ) {
-              console.log('🔄 refreshing ', element);
-
-              bound.refresh(force);
-              continue;
-            }
-
-            if (
-              bound.dependencies.isInvalidatedByChildlistChanges(force.elementLocalnamesWithChanges)
-            ) {
-              console.log('🔄 refreshing ', element);
-
-              bound.refresh(force);
-              continue;
-            }
-          }
-          if (!(element.inert === true)) {
-            // testing for inert catches model and action elements and should just leave updateable html elements
-            Fore.refreshChildren(element, force);
+        } else if (typeof force === 'object') {
+          // future selective refresh logic can live here if you re-enable it
+          const maybePromise = bound.refresh(force);
+          if (maybePromise && typeof maybePromise.then === 'function') {
+            await maybePromise;
           }
         }
       }
-      resolve('done');
-    });
 
-    return refreshed;
+      // Traverse DOM unless inert
+      if (!(element.inert === true)) {
+        await Fore.refreshChildren(element, force);
+      }
+    }
   }
 
   static copyDom(inputElement) {
@@ -561,7 +521,10 @@ export class Fore {
     const reg = /(>)(<)(\/*)/g;
     const wsexp = / *(.*) +\n/g;
     const contexp = /(<.+>)(.+\n)/g;
-    xml = xml.replace(reg, '$1\n$2$3').replace(wsexp, '$1\n').replace(contexp, '$1\n$2');
+    xml = xml
+      .replace(reg, '$1\n$2$3')
+      .replace(wsexp, '$1\n')
+      .replace(contexp, '$1\n$2');
     let formatted = '';
     const lines = xml.split('\n');
     let indent = 0;

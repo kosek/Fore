@@ -33,6 +33,8 @@ export class FxRepeatitem extends withDraggability(UIElement, true) {
     this.attachShadow({ mode: 'open', delegatesFocus: true });
 
     this.dropTarget = null;
+    // TODO: rename to position?
+    this.index = -1;
   }
 
   connectedCallback() {
@@ -48,6 +50,8 @@ export class FxRepeatitem extends withDraggability(UIElement, true) {
         `;
     this.getOwnerForm().registerLazyElement(this);
 
+    // Keep ref as a *property only* so repeatitem does not become the nearest [ref] for its children.
+    // Its children already get their context from the repeatitem via getInScopeContext().
     this.ref = `${this.parentNode.ref}`;
 
     this.tabindex = 0;
@@ -56,7 +60,7 @@ export class FxRepeatitem extends withDraggability(UIElement, true) {
   disconnectedCallback() {
     super.disconnectedCallback();
     this.removeEventListener('click', this._dispatchIndexChange);
-    this.removeEventListener('focusin', this._handleFocus);
+    this.removeEventListener('focusin', this._dispatchIndexChange);
   }
 
   init() {
@@ -73,7 +77,7 @@ export class FxRepeatitem extends withDraggability(UIElement, true) {
       }
     */
 
-  _dispatchIndexChange() {
+  async _dispatchIndexChange() {
     /**
      * @type {import('./fx-repeat.js').FxRepeat}
      */
@@ -82,33 +86,44 @@ export class FxRepeatitem extends withDraggability(UIElement, true) {
       // The index did not really change if it did not change :wink:
       return;
     }
-    this.dispatchEvent(
+    await this.dispatchEvent(
       new CustomEvent('item-changed', {
         composed: false,
         bubbles: true,
         detail: { item: this, index: this.index },
       }),
     );
+
+    // Refresh after all of the listeners for that item-changed have had their turn to update!
+    this.getOwnerForm().refresh();
   }
 
-  refresh(force) {
-    this.modelItem = this.getModelItem();
-    console.log('repeatitem modelitem', this.modelItem);
-    // this.attachObserver();
-    // ### register ourselves as boundControl
-    if (!this.modelItem.boundControls.includes(this)) {
-      this.modelItem.boundControls.push(this);
+  update(_modelItem) {
+    // Repeatitems must refresh when their ModelItem facets (e.g. relevant) change,
+    // but they should NOT have a `ref` attribute (that would change inscope context resolution).
+    const fore = this.getOwnerForm();
+    if (!fore) return;
 
-      if (this.modelItem && !this.modelItem.relevant) {
-        this.removeAttribute('relevant');
-        this.setAttribute('nonrelevant', '');
-      } else {
-        this.removeAttribute('nonrelevant');
-        this.setAttribute('relevant', '');
-      }
+    if (fore.isRefreshPhase) {
+      fore.addToBatchedNotifications(this);
+    } else {
+      this.refresh();
     }
-    // Always recurse for these refreshes, especially when forced
-    Fore.refreshChildren(this, force);
+  }
+
+  async refresh(force = false) {
+    // this.modelItem = this.getModelItem();
+    this.attachObserver();
+    // console.log('🔄 repeatitem modelitem', this.getModelItem());
+
+    if (this.modelItem && !this.modelItem.relevant) {
+      this.removeAttribute('relevant');
+      this.setAttribute('nonrelevant', '');
+    } else {
+      this.removeAttribute('nonrelevant');
+      this.setAttribute('relevant', '');
+    }
+    await Fore.refreshChildren(this, force);
   }
 }
 

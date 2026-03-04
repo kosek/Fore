@@ -8,8 +8,8 @@ import { XPathUtil } from '../xpath-util.js';
 import { withDraggability } from '../withDraggability.js';
 import { UIElement } from './UIElement.js';
 import { getPath } from '../xpath-path.js';
-
-// import {DependencyNotifyingDomFacade} from '../DependencyNotifyingDomFacade';
+import { FxModel } from '../fx-model.js';
+import { FxBind } from '../fx-bind.js';
 
 /**
  * `fx-repeat`
@@ -19,12 +19,7 @@ import { getPath } from '../xpath-path.js';
  * Template is a standard HTML `<template>` element. Once instanciated the template
  * is moved to the shadowDOM of the repeat for safe re-use.
  *
- *
- *
  * @customElement
- * @demo demo/todo.html
- *
- * todo: it should be seriously be considered to extend FxContainer instead but needs refactoring first.
  * @extends {ForeElementMixin}
  */
 export class FxRepeat extends withDraggability(UIElement, false) {
@@ -66,6 +61,380 @@ export class FxRepeat extends withDraggability(UIElement, false) {
     this.index = 1;
     this.repeatSize = 0;
     this.attachShadow({ mode: 'open', delegatesFocus: true });
+    this.opNum = 0; // global number of operations
+
+    this.handleInsertHandler = null;
+    this.handleDeleteHandler = null;
+
+    // Tracks ModelItems we observe due to JSON lens lookups inside predicate expressions
+    // (e.g. instance('data')?ui?query). Needed so the repeat refreshes when the query changes.
+    this._jsonPredicateDeps = new Set();
+    this._jsonPredicateDepsObserved = false;
+
+    // Flag used to suppress "programmatic index changed" notifications when setIndex()
+    // is called as a direct reaction to a repeatitem's item-changed event.
+    this._settingIndexFromItemChanged = false;
+  }
+
+  // ------------------------------------------------------------
+  // JSON ref helpers (for routing insert/delete events correctly)
+  // ------------------------------------------------------------
+
+  _stripJsonRefToContainer(ref) {
+    let s = String(ref || '').trim();
+    if (!s) return '';
+
+    // If this is a repeat nodeset ref like: instance('data')?movies?*[...]
+    // strip everything from "?*" onward => instance('data')?movies
+    const starPos = s.indexOf('?*');
+    if (starPos >= 0) s = s.slice(0, starPos).trim();
+
+    // Also strip trailing predicates if someone wrote ...?movies[...]
+    // (not common for lens refs, but keep it safe)
+    s = s.replace(/\[[\s\S]*\]\s*$/g, '').trim();
+
+    return s;
+  }
+
+  _inferArrayKeyFromRef() {
+    const r = String(this.ref || this.getAttribute('ref') || '').trim();
+
+    // instance('data')?movies?*...
+    let m = r.match(/\?([^?\[\]]+)\?\*\s*/);
+    if (m) return m[1];
+
+    // instance('data')?movies  (no ?*)
+    m = r.match(/\?([^?\[\]]+)\s*$/);
+    if (m) return m[1];
+
+    return null;
+  }
+
+  _sameJsonContainer(detailRef) {
+    const myContainer = this._stripJsonRefToContainer(this.ref);
+    const evContainer = this._stripJsonRefToContainer(detailRef);
+    if (!myContainer || !evContainer) return false;
+    return myContainer === evContainer;
+  }
+
+  _matchesJsonParent(detail) {
+    // Fallback routing based on insertedParent / insertedNodes.parent
+    const parent =
+        detail?.insertedParent ||
+        detail?.insertedNodes?.parent ||
+        detail?.insertedNodes?.insertedParent ||
+        null;
+
+    if (!parent || !parent.__jsonlens__) return false;
+
+    const myKey = this._inferArrayKeyFromRef();
+    if (myKey && String(parent.keyOrIndex) !== String(myKey)) return false;
+
+    // If instance is known on both sides, ensure it matches
+    const myInstanceId = XPathUtil.resolveInstance(this, this.ref);
+    if (myInstanceId && parent.instanceId && String(myInstanceId) !== String(parent.instanceId)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  connectedCallback() {
+    super.connectedCallback();
+    this.template = this.querySelector('template');
+
+    this.ref = this.getAttribute('ref');
+    this.dependencies.addXPath(this.ref);
+
+    this.addEventListener('item-changed', e => {
+      // IMPORTANT: when *we* emit item-changed from the repeat (programmatic setIndex),
+      // we must not react to it (would recurse).
+      if (e && e.target === this) return;
+      if (e?.detail?.source === 'repeat') return;
+
+      const { item } = e.detail;
+      this._settingIndexFromItemChanged = true;
+      try {
+        this.setIndex(item.index);
+      } finally {
+        this._settingIndexFromItemChanged = false;
+      }
+    });
+
+    // ----------------
+    // INSERT handler
+    // ----------------
+    this.handleInsertHandler = event => {
+      const { detail } = event;
+      const myForeId = this.getOwnerForm().id;
+      if (myForeId !== detail.foreId) return;
+
+      const fore = this.getOwnerForm();
+
+      // Detect JSON insert (robust)
+      const insertedParent = detail?.insertedParent;
+      const insertedNode = detail?.insertedNodes;
+      const isJson =
+          !!detail?.isJson ||
+          !!insertedParent?.__jsonlens__ ||
+          !!insertedNode?.__jsonlens__ ||
+          !!insertedNode?.parent?.__jsonlens__;
+
+      if (isJson) {
+        // IMPORTANT FIX:
+        // The old code compared detail.ref strictly to a computed container ref.
+        // For repeats like instance('data')?movies?*[predicate] the container is "instance('data')?movies"
+        // while detail.ref is usually exactly that container. But if we keep the predicate in this.ref,
+        // a strict string compare will FAIL and the insert never updates the DOM -> stays at 12.
+        //
+        // We accept the event if either:
+        //  1) detail.ref matches our container (predicate stripped), OR
+        //  2) insertedParent / insertedNode.parent matches our array key + instance.
+        const okByRef = this._sameJsonContainer(detail?.ref);
+        const okByParent = this._matchesJsonParent(detail);
+
+        if (!okByRef && !okByParent) return;
+
+        this._handleJsonInserted(detail);
+        return;
+      }
+
+      // ----------------
+      // XML insert: keep existing behavior
+      // ----------------
+      const oldNodesetLength = this.nodeset.length;
+      this._evalNodeset();
+      const newNodesetLength = this.nodeset.length;
+      if (oldNodesetLength === newNodesetLength) return;
+
+      const inserted = detail.insertedNodes;
+      const insertionIndex = this.nodeset.indexOf(inserted) + 1; // 1-based
+
+      const repeatItems = Array.from(
+          this.querySelectorAll(
+              ':scope > fx-repeat-item, :scope > fx-repeatitem, :scope > .repeat-item',
+          ),
+      );
+
+      const newRepeatItem = this._createNewRepeatItem();
+
+      const beforeNode = repeatItems[insertionIndex - 1] ?? null;
+      this.insertBefore(newRepeatItem, beforeNode);
+      newRepeatItem.index = insertionIndex;
+      this._initVariables(newRepeatItem);
+
+      newRepeatItem.nodeset = inserted;
+
+      for (let i = insertionIndex - 1; i < repeatItems.length; ++i) {
+        repeatItems[i].index += 1;
+      }
+
+      this.setIndex(insertionIndex);
+
+      this.opNum++;
+      let parentModelItem = FxBind.createModelItem(this.ref, inserted, newRepeatItem, this.opNum);
+      // IMPORTANT: registerModelItem may return an existing canonical ModelItem for the same path.
+      // Always keep using the returned instance to avoid "ghost" ModelItems that still notify.
+      parentModelItem = this.getModel().registerModelItem(parentModelItem);
+      newRepeatItem.modelItem = parentModelItem;
+
+      this._createModelItemsRecursively(newRepeatItem, parentModelItem);
+
+      fore.scanForNewTemplateExpressionsNextRefresh();
+      fore.addToBatchedNotifications(newRepeatItem);
+    };
+
+    // ----------------
+    // DELETE handler
+    // ----------------
+    this.handleDeleteHandler = event => {
+      const { detail } = event;
+      if (!detail || !detail.deletedNodes || detail.deletedNodes.length === 0) return;
+
+      const fore = this.getOwnerForm();
+      const myForeId = fore?.id;
+      if (detail.foreId && myForeId !== detail.foreId) return;
+
+      const deletedNodes = Array.from(detail.deletedNodes || []);
+      const first = deletedNodes[0];
+
+      const isJson =
+          !!detail.isJson ||
+          !!first?.__jsonlens__ ||
+          !!first?.parent?.__jsonlens__ ||
+          deletedNodes.some(n => n?.__jsonlens__ || n?.parent?.__jsonlens__);
+
+      if (isJson) {
+        // Route by parent array container, NOT by detail.ref string.
+        const parent =
+            (detail.parent && Array.isArray(detail.parent.value) && detail.parent) ||
+            (first?.parent && Array.isArray(first.parent.value) ? first.parent : null);
+
+        if (!parent) return;
+
+        const myKey = this._inferArrayKeyFromRef();
+
+        if (myKey && String(parent.keyOrIndex) !== String(myKey)) return;
+
+        if (
+            detail.instanceId &&
+            parent.instanceId &&
+            String(detail.instanceId) !== String(parent.instanceId)
+        ) {
+          return;
+        }
+
+        this._handleJsonDeleted(detail);
+        return;
+      }
+
+      // XML delete: keep existing behavior
+      detail.deletedNodes.forEach(node => {
+        this.handleDelete(node);
+      });
+      fore?.addToBatchedNotifications?.(this);
+    };
+
+    document.addEventListener('insert', this.handleInsertHandler, true);
+    document.addEventListener('deleted', this.handleDeleteHandler, true);
+
+    // ----------------
+    // Mutation observer (XML only)
+    // ----------------
+    let bufferedMutationRecords = [];
+    let debouncedOnMutations = null;
+    this.mutationObserver = new MutationObserver(mutations => {
+      bufferedMutationRecords.push(...mutations);
+      if (!debouncedOnMutations) {
+        debouncedOnMutations = new Promise(() => {
+          debouncedOnMutations = null;
+          const records = bufferedMutationRecords;
+          bufferedMutationRecords = [];
+          for (const mutation of records) {
+            if (mutation.type === 'childList') {
+              const added = mutation.addedNodes[0];
+              if (added) {
+                const instance = XPathUtil.resolveInstance(this, this.ref);
+                const path = getPath(added, instance);
+                Fore.dispatch(this, 'path-mutated', { path, index: this.index });
+              }
+            }
+          }
+        });
+      }
+    });
+
+    this.getOwnerForm().registerLazyElement(this);
+
+    const style = `
+      :host{ }
+      .fade-out-bottom {
+          -webkit-animation: fade-out-bottom 0.7s cubic-bezier(0.250, 0.460, 0.450, 0.940) both;
+          animation: fade-out-bottom 0.7s cubic-bezier(0.250, 0.460, 0.450, 0.940) both;
+      }
+   `;
+    const html = `
+          <slot name="header"></slot>
+          <slot></slot>
+  `;
+
+    this.shadowRoot.innerHTML = `
+      <style>${style}</style>
+      ${html}
+  `;
+  }
+
+  /**
+   * JSON insert (incremental):
+   * - re-evaluate nodeset once to get authoritative post-insert ordering
+   * - insert one new repeatitem at the correct position (using detail.index)
+   * - rebind only shifted repeatitems (pos..end) and refresh them
+   */
+  _handleJsonInserted(detail) {
+    const fore = this.getOwnerForm();
+
+    const repeatItems = () =>
+        Array.from(
+            this.querySelectorAll(
+                ':scope > fx-repeat-item, :scope > fx-repeatitem, :scope > .repeat-item',
+            ),
+        );
+
+    // 1) Determine insertion index (1-based) from the event.
+    // Do NOT use indexOf(insertedNodes) for JSON.
+    let insertionIndex1 = Number(detail.index);
+    if (!Number.isFinite(insertionIndex1) || insertionIndex1 < 1) {
+      const ki = detail.insertedNodes?.keyOrIndex;
+      if (typeof ki === 'number') insertionIndex1 = ki + 1;
+    }
+    if (!Number.isFinite(insertionIndex1) || insertionIndex1 < 1) insertionIndex1 = 1;
+
+    // 2) Re-evaluate nodeset AFTER mutation to get correct order.
+    const oldLen = Array.isArray(this.nodeset) ? this.nodeset.length : 0;
+    this._evalNodeset();
+    const newLen = Array.isArray(this.nodeset) ? this.nodeset.length : 0;
+    if (newLen === oldLen) return;
+
+    // Clamp
+    insertionIndex1 = Math.max(1, Math.min(insertionIndex1, newLen));
+    const pos0 = insertionIndex1 - 1;
+
+    // 3) Insert DOM row: set nodeset/index BEFORE inserting into DOM.
+    const before = repeatItems();
+    const beforeNode = before[pos0] ?? null;
+
+    const newRepeatItem = this._createNewRepeatItem();
+    newRepeatItem.index = pos0 + 1;
+    this._initVariables(newRepeatItem);
+    newRepeatItem.nodeset = this.nodeset[pos0];
+
+    this.insertBefore(newRepeatItem, beforeNode);
+
+    // Ensure it gets initialized/rendered
+    fore.registerLazyElement(newRepeatItem);
+    if (fore.createNodes) {
+      fore.initData(newRepeatItem);
+    }
+    fore.scanForNewTemplateExpressionsNextRefresh();
+    fore.addToBatchedNotifications(newRepeatItem);
+
+    // 4) Rebind shifted rows (pos0+1..end) and refresh only those.
+    const after = repeatItems();
+
+    for (let i = pos0 + 1; i < after.length; i++) {
+      const ri = after[i];
+      ri.index = i + 1;
+
+      const newNode = this.nodeset[i];
+      if (ri.nodeset !== newNode) {
+        ri.nodeset = newNode;
+        if (fore.createNodes) fore.initData(ri);
+      }
+
+      fore.addToBatchedNotifications(ri);
+    }
+
+    // Select inserted row
+    this.setIndex(pos0 + 1);
+  }
+
+  disconnectedCallback() {
+    // Ensure UIElement cleanup runs (removes observer for primary binding, etc.)
+    if (super.disconnectedCallback) super.disconnectedCallback();
+
+    // Remove observers that were added for predicate dependencies
+    if (this._jsonPredicateDeps && this._jsonPredicateDeps.size) {
+      for (const mi of this._jsonPredicateDeps) {
+        if (mi && typeof mi.removeObserver === 'function') {
+          mi.removeObserver(this);
+        }
+      }
+      this._jsonPredicateDeps.clear();
+    }
+    this._jsonPredicateDepsObserved = false;
+
+    document.removeEventListener('deleted', this.handleDeleteHandler, true);
+    document.removeEventListener('insert', this.handleInsertHandler, true);
   }
 
   get repeatSize() {
@@ -77,12 +446,27 @@ export class FxRepeat extends withDraggability(UIElement, false) {
   }
 
   setIndex(index) {
-    // console.log('new repeat index ', index);
     this.index = index;
-    const rItems = this.querySelectorAll(':scope > fx-repeatitem');
-    this.applyIndex(rItems[this.index - 1]);
 
-    this.getOwnerForm().refresh({ reason: 'index-function', elementLocalnamesWithChanges: [] });
+    const rItems = this.querySelectorAll(':scope > fx-repeatitem');
+    const selected = rItems[this.index - 1];
+
+    this.applyIndex(selected);
+
+    // If setIndex is called programmatically (insert/delete), we must notify dependents
+    // (fx-group/fx-control/fx-output with index('repeatId') in ref).
+    //
+    // When setIndex is invoked as a reaction to a repeatitem click/focus,
+    // the repeatitem already dispatched item-changed and dependents already react.
+    if (!this._settingIndexFromItemChanged) {
+      this.dispatchEvent(
+          new CustomEvent('item-changed', {
+            composed: false,
+            bubbles: false,
+            detail: { item: selected || null, index: this.index, source: 'repeat' },
+          }),
+      );
+    }
   }
 
   applyIndex(repeatItem) {
@@ -104,111 +488,171 @@ export class FxRepeat extends withDraggability(UIElement, false) {
     return this.getAttribute('ref');
   }
 
-  connectedCallback() {
-    super.connectedCallback();
-    // console.log('connectedCallback',this);
-    // this.display = window.getComputedStyle(this, null).getPropertyValue("display");
-    this.ref = this.getAttribute('ref');
-    this.dependencies.addXPath(this.ref);
-    // this.ref = this._getRef();
-    // console.log('### fx-repeat connected ', this.id);
-    this.addEventListener('item-changed', e => {
-      const { item } = e.detail;
-      this.setIndex(item.index);
-    });
-    // todo: review - this is just used by append action - event consolidation ?
-    document.addEventListener('index-changed', e => {
-      e.stopPropagation();
-      if (!e.target === this) return;
-      // const { item } = e.detail;
-      // const idx = Array.from(this.children).indexOf(item);
-      const { index } = e.detail;
-      this.index = parseInt(index, 10);
-      this.applyIndex(this.children[index - 1]);
-    });
-    /*
-        document.addEventListener('insert', e => {
-          const nodes = e.detail.insertedNodes;
-          this.index = e.detail.position;
-          console.log('insert catched', nodes, this.index);
-        });
-    */
+  _createModelItemsRecursively(parentNode, parentModelItem) {
+    const parentWithDewey = parentModelItem?.path || null;
 
-    // if (this.getOwnerForm().lazyRefresh) {
-    /**
-     * @type {MutationRecord[]}
-     */
-    let bufferedMutationRecords = [];
-    let debouncedOnMutations = null;
-    this.mutationObserver = new MutationObserver(mutations => {
-      bufferedMutationRecords.push(...mutations);
-      if (!debouncedOnMutations) {
-        debouncedOnMutations = new Promise(() => {
-          debouncedOnMutations = null;
-          const records = bufferedMutationRecords;
-          bufferedMutationRecords = [];
-          let shouldRefresh = false;
-          for (const mutation of records) {
-            if (mutation.type === 'childList') {
-              const added = mutation.addedNodes[0];
-              if (added) {
-                const instance = XPathUtil.resolveInstance(this, this.ref);
-                const path = getPath(added, instance);
-                // console.log('path mutated', path);
-                // this.dispatch('path-mutated',{'path':path,'nodeset':this.nodeset,'index': this.index});
-                // this.index = index;
-                // const prev = mutations[0].previousSibling.previousElementSibling;
-                // const index = prev.index();
-                // this.applyIndex(this.index -1);
+    const __applyDeweyRewrite = mi => {
+      if (!mi || typeof mi.path !== 'string' || !parentModelItem?.path) return;
 
-                Fore.dispatch(this, 'path-mutated', { path, index: this.index });
-              }
-              if (!this.getOwnerForm().initialRun) {
-                shouldRefresh = true;
-              }
+      const pWith = parentModelItem.path;
+      const opMatch = pWith.match(/_(\d+)$/);
+      if (!opMatch) return;
+      const op = opMatch[1];
+
+      const toDollar = s => s.replace(/^instance\('([^']+)'\)\//, (_m, g1) => `$${g1}/`);
+      const parentBaseNorm = toDollar(pWith).replace(/_\d+$/, '');
+      const childNorm = toDollar(mi.path);
+
+      if (!childNorm.startsWith(parentBaseNorm)) return;
+
+      const childUsesInstanceFn = /^instance\('/.test(mi.path);
+      const parentBaseInChildStyle = childUsesInstanceFn
+          ? parentBaseNorm.replace(/^\$([A-Za-z0-9_-]+)\//, `instance('$1')/`)
+          : parentBaseNorm;
+
+      if (mi.path.startsWith(`${parentBaseInChildStyle}_`)) return;
+
+      mi.path = `${parentBaseInChildStyle}_${op}${mi.path.slice(parentBaseInChildStyle.length)}`;
+    };
+
+    Array.from(parentNode.children).forEach(child => {
+      const nextParentMI = parentModelItem;
+
+      const isWidgetEl =
+          child &&
+          ((child.classList && child.classList.contains('widget')) ||
+              (typeof Fore !== 'undefined' && Fore.isWidget && Fore.isWidget(child)) ||
+              (child.tagName &&
+                  ['INPUT', 'SELECT', 'TEXTAREA', 'OPTION', 'DATALIST'].includes(child.tagName)));
+
+      if (!isWidgetEl && child.hasAttribute('ref')) {
+        const ref = child.getAttribute('ref').trim();
+        if (ref && ref !== '.') {
+          let node = evaluateXPath(ref, parentModelItem.node, this);
+          if (Array.isArray(node)) node = node[0];
+
+          if (node) {
+            let modelItem = this.getModel().getModelItem(node);
+            if (!modelItem) {
+              modelItem = FxBind.createModelItem(ref, node, child, null);
+              modelItem.parentModelItem = parentModelItem;
+              // IMPORTANT: keep using the canonical instance returned by registerModelItem.
+              // Otherwise a throwaway ModelItem can leak into observer graphs and be notified.
+              modelItem = this.getModel().registerModelItem(modelItem);
             }
+
+            __applyDeweyRewrite(modelItem);
+
+            child.nodeset = node;
+            if (child.attachObserver) child.attachObserver();
           }
-          if (shouldRefresh) {
-            this.refresh();
-          }
-        });
+        }
       }
+
+      if (!isWidgetEl) this._createModelItemsRecursively(child, nextParentMI);
     });
-
-    // console.log('mutations', mutations);
-    // }
-    this.getOwnerForm().registerLazyElement(this);
-
-    const style = `
-      :host{
-      }
-       .fade-out-bottom {
-          -webkit-animation: fade-out-bottom 0.7s cubic-bezier(0.250, 0.460, 0.450, 0.940) both;
-          animation: fade-out-bottom 0.7s cubic-bezier(0.250, 0.460, 0.450, 0.940) both;
-      }
-      .fade-out-bottom {
-          -webkit-animation: fade-out-bottom 0.7s cubic-bezier(0.250, 0.460, 0.450, 0.940) both;
-          animation: fade-out-bottom 0.7s cubic-bezier(0.250, 0.460, 0.450, 0.940) both;
-      }
-   `;
-    const html = `
-          <slot name="header"></slot>
-          <slot></slot>
-          <slot name="footer"></slot>
-        `;
-    this.shadowRoot.innerHTML = `
-            <style>
-                ${style}
-            </style>
-            ${html}
-        `;
-
-    // this.init();
   }
 
-  /**
-   * @returns {import('./fx-repeatitem.js').FxRepeatitem}
-   */
+  _handleJsonDeleted(detail) {
+    const fore = this.getOwnerForm();
+
+    const repeatItems = () =>
+        Array.from(
+            this.querySelectorAll(
+                ':scope > fx-repeat-item, :scope > fx-repeatitem, :scope > .repeat-item',
+            ),
+        );
+
+    let indices0 = Array.isArray(detail.deletedIndexes0)
+        ? detail.deletedIndexes0.slice()
+        : Array.from(detail.deletedNodes || [])
+            .map(n => (n && typeof n.keyOrIndex === 'number' ? n.keyOrIndex : -1))
+            .filter(i => i >= 0);
+
+    indices0 = Array.from(new Set(indices0)).sort((a, b) => b - a);
+    if (indices0.length === 0) return;
+
+    let currentIndex1 = Number(this.getAttribute('index') || this.index || 1);
+    if (!Number.isFinite(currentIndex1) || currentIndex1 < 1) currentIndex1 = 1;
+
+    const deletedIdx1Asc = indices0.map(i0 => i0 + 1).sort((a, b) => a - b);
+    let nextIndex1 = currentIndex1;
+    for (const d1 of deletedIdx1Asc) {
+      if (nextIndex1 > d1) nextIndex1 -= 1;
+    }
+
+    const before = repeatItems();
+    for (const idx0 of indices0) {
+      const itemEl = before[idx0];
+      if (!itemEl) continue;
+
+      try {
+        fore?.unRegisterLazyElement?.(itemEl);
+      } catch (_e) {}
+
+      itemEl.remove();
+    }
+
+    this._evalNodeset();
+
+    const start0 = Math.min(...indices0);
+    const after = repeatItems();
+
+    for (let i = start0; i < after.length; i++) {
+      const ri = after[i];
+      ri.index = i + 1;
+
+      const newNode = Array.isArray(this.nodeset) ? this.nodeset[i] : null;
+      if (ri.nodeset !== newNode) {
+        ri.nodeset = newNode;
+        if (fore?.createNodes) fore.initData(ri);
+      }
+
+      fore?.addToBatchedNotifications?.(ri);
+    }
+
+    const newLen = after.length;
+    if (newLen === 0) {
+      this.setAttribute('index', '0');
+      this.index = 0;
+      this._removeIndexMarker?.();
+      return;
+    }
+
+    nextIndex1 = Math.max(1, Math.min(nextIndex1, newLen));
+    this.setIndex(nextIndex1);
+  }
+
+  handleDelete(deleted) {
+    const items = Array.from(
+        this.querySelectorAll(
+            ':scope > fx-repeat-item, :scope > fx-repeatitem, :scope > .repeat-item',
+        ),
+    );
+
+    this._evalNodeset();
+
+    const indexToRemove = items.findIndex(item => item.nodeset === deleted);
+    if (indexToRemove === -1) {
+      return;
+    }
+    const itemToRemove = items[indexToRemove];
+    itemToRemove.remove();
+
+    const newLength = this.querySelectorAll(
+        ':scope > fx-repeat-item, :scope > fx-repeatitem, :scope > .repeat-item',
+    ).length;
+
+    let nextIndex = indexToRemove + 1;
+    if (newLength === 0) {
+      nextIndex = 0;
+    } else if (nextIndex > newLength) {
+      nextIndex = newLength;
+    }
+
+    this.setIndex(nextIndex);
+  }
+
   _createNewRepeatItem() {
     const newItem = document.createElement('fx-repeatitem');
 
@@ -223,13 +667,7 @@ export class FxRepeat extends withDraggability(UIElement, false) {
   }
 
   init() {
-    // ### there must be a single 'template' child
-    // console.log('##### repeat init ', this.id);
-    // if(!this.inited) this.init();
-    // does not use this.evalInContext as it is expecting a nodeset instead of single node
     this._evalNodeset();
-    // console.log('##### ',this.id, this.nodeset);
-
     this._initTemplate();
     this._initRepeatItems();
 
@@ -237,16 +675,179 @@ export class FxRepeat extends withDraggability(UIElement, false) {
     this.inited = true;
   }
 
-  /**
-   * repeat has no own modelItems
-   * @private
-   */
+  _observeJsonPredicateDependencies(contextNode) {
+    if (this._jsonPredicateDepsObserved) return;
+
+    const ref = String(this.ref || this.getAttribute('ref') || '').trim();
+    if (!ref || !ref.includes('[') || !ref.includes('?')) return;
+
+    const model = this.getModel && this.getModel();
+    if (!model) return;
+
+    const predicates = [];
+    const predRe = /\[([\s\S]+?)\]/g;
+    let pm;
+    while ((pm = predRe.exec(ref)) !== null) {
+      if (pm[1]) predicates.push(pm[1]);
+    }
+    if (predicates.length === 0) return;
+
+    const isBoundary = ch =>
+        ch === undefined ||
+        ch === null ||
+        /\s/.test(ch) ||
+        ch === ',' ||
+        ch === ')' ||
+        ch === ']' ||
+        ch === '+' ||
+        ch === '-' ||
+        ch === '*' ||
+        ch === '=' ||
+        ch === '>' ||
+        ch === '<' ||
+        ch === '!' ||
+        ch === '|' ||
+        ch === '&';
+
+    const lookups = new Set();
+
+    const readInstanceLensAt = (src, start) => {
+      if (!src.slice(start).match(/^instance\s*\(/)) return null;
+
+      let j = start;
+      let inS = false;
+      let inD = false;
+      let depth = 0;
+
+      while (j < src.length) {
+        const ch = src[j];
+
+        if (ch === "'" && !inD) {
+          inS = !inS;
+          j += 1;
+          continue;
+        }
+        if (ch === '"' && !inS) {
+          inD = !inD;
+          j += 1;
+          continue;
+        }
+        if (inS || inD) {
+          j += 1;
+          continue;
+        }
+
+        if (ch === '(') depth += 1;
+        else if (ch === ')') {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+        j += 1;
+      }
+
+      if (j >= src.length) return null;
+
+      let k = j + 1;
+      while (k < src.length && /\s/.test(src[k])) k += 1;
+      if (src[k] !== '?') return null;
+
+      k += 1;
+      let bracketDepth = 0;
+      inS = false;
+      inD = false;
+
+      while (k < src.length) {
+        const ch = src[k];
+
+        if (ch === "'" && !inD) {
+          inS = !inS;
+          k += 1;
+          continue;
+        }
+        if (ch === '"' && !inS) {
+          inD = !inD;
+          k += 1;
+          continue;
+        }
+        if (inS || inD) {
+          k += 1;
+          continue;
+        }
+
+        if (ch === '[') bracketDepth += 1;
+        else if (ch === ']') {
+          if (bracketDepth > 0) bracketDepth -= 1;
+          else break;
+        }
+
+        if (bracketDepth === 0 && isBoundary(ch)) break;
+        k += 1;
+      }
+
+      return { raw: src.slice(start, k), end: k };
+    };
+
+    for (const predicate of predicates) {
+      const src = String(predicate ?? '');
+
+      let inSingle = false;
+      let inDouble = false;
+
+      for (let i = 0; i < src.length; i += 1) {
+        const ch = src[i];
+
+        if (ch === "'" && !inDouble) {
+          inSingle = !inSingle;
+          continue;
+        }
+        if (ch === '"' && !inSingle) {
+          inDouble = !inDouble;
+          continue;
+        }
+        if (inSingle || inDouble) continue;
+
+        const lens = readInstanceLensAt(src, i);
+        if (lens && lens.raw && lens.raw.includes('?')) {
+          lookups.add(lens.raw.trim());
+          i = lens.end - 1;
+        }
+      }
+    }
+
+    if (lookups.size === 0) return;
+
+    for (const lookup of lookups) {
+      try {
+        const resolved = evaluateXPath(lookup, contextNode, this);
+
+        let node = null;
+        if (Array.isArray(resolved)) {
+          const first = resolved[0];
+          node = Array.isArray(first) ? first[0] : first;
+        } else {
+          node = resolved;
+        }
+
+        if (!node) continue;
+
+        const mi = FxModel.lazyCreateModelItem(model, lookup, node, this);
+        if (mi && typeof mi.addObserver === 'function') {
+          if (!this._jsonPredicateDeps.has(mi)) {
+            mi.addObserver(this);
+            this._jsonPredicateDeps.add(mi);
+          }
+        }
+      } catch (_e) {
+        // ignore
+      }
+    }
+
+    this._jsonPredicateDepsObserved = true;
+  }
+
   _evalNodeset() {
-    // const inscope = this.getInScopeContext();
     const inscope = getInScopeContext(this.getAttributeNode('ref') || this, this.ref);
-    // console.log('##### inscope ', inscope);
-    // console.log('##### ref ', this.ref);
-    // now we got a nodeset and attach MutationObserver to it
+    if (!inscope) return;
 
     if (this.mutationObserver && inscope.nodeName) {
       this.mutationObserver.observe(inscope, {
@@ -255,19 +856,11 @@ export class FxRepeat extends withDraggability(UIElement, false) {
       });
     }
 
-    /*
-              this.touchedPaths = new Set();
-              const instance = XPathUtil.resolveInstance(this, this.ref);
-              const depTrackDomfacade = new DependencyNotifyingDomFacade((node) => {
-                  this.touchedPaths.add(XPathUtil.getPath(node, instance));
-              });
-              const rawNodeset = evaluateXPath(this.ref, inscope, this, {}, {}, depTrackDomfacade );
-        */
     const rawNodeset = evaluateXPath(this.ref, inscope, this);
 
-    // console.log('Touched!', this.ref, [...this.touchedPaths].join(', '));
+    this._observeJsonPredicateDependencies(inscope);
+
     if (rawNodeset.length === 1 && Array.isArray(rawNodeset[0])) {
-      // This XPath likely returned an XPath array. Just collapse to that array
       this.nodeset = rawNodeset[0];
       return;
     }
@@ -275,51 +868,35 @@ export class FxRepeat extends withDraggability(UIElement, false) {
   }
 
   async refresh(force) {
-    console.log('🔄 fx-repeat.refresh on', this.id);
-
     if (!this.inited) this.init();
-    // console.time('repeat-refresh', this);
+
     this._evalNodeset();
 
-    // ### register ourselves as boundControl
-    /*
-            const modelItem = this.getModelItem();
-            if (!modelItem.boundControls.includes(this)) {
-              modelItem.boundControls.push(this);
-            }
-        */
-    // console.log('repeat refresh nodeset ', this.nodeset);
-    // console.log('repeatCount', this.repeatCount);
-
-    const repeatItems = this.querySelectorAll(':scope > fx-repeatitem');
-    const repeatItemCount = repeatItems.length;
+    let repeatItems = this.querySelectorAll(':scope > fx-repeatitem');
+    let repeatItemCount = repeatItems.length;
 
     let nodeCount = 1;
     if (Array.isArray(this.nodeset)) {
       nodeCount = this.nodeset.length;
     }
 
-    // const contextSize = this.nodeset.length;
     const contextSize = nodeCount;
-    // todo: review - cant the context really never be smaller than the repeat count?
-    // todo: this code can be deprecated probably but check first
+
     if (contextSize < repeatItemCount) {
       for (let position = repeatItemCount; position > contextSize; position -= 1) {
-        // remove repeatitem
         const itemToRemove = repeatItems[position - 1];
         itemToRemove.parentNode.removeChild(itemToRemove);
         this.getOwnerForm().unRegisterLazyElement(itemToRemove);
-        // this._fadeOut(itemToRemove);
-        // Fore.fadeOutElement(itemToRemove)
       }
     }
 
+    // DOM changed: re-query repeatitems
+    repeatItems = this.querySelectorAll(':scope > fx-repeatitem');
+    repeatItemCount = repeatItems.length;
+
     if (contextSize > repeatItemCount) {
       for (let position = repeatItemCount + 1; position <= contextSize; position += 1) {
-        // add new repeatitem
-
         const newItem = this._createNewRepeatItem();
-
         this.appendChild(newItem);
 
         this._initVariables(newItem);
@@ -331,85 +908,49 @@ export class FxRepeat extends withDraggability(UIElement, false) {
           this.getOwnerForm().initData(newItem);
         }
 
-        // Tell the owner form we might have new template expressions here
         this.getOwnerForm().scanForNewTemplateExpressionsNextRefresh();
 
         newItem.refresh(true);
       }
     }
 
-    // ### update nodeset of repeatitems
+    // DOM changed: re-query repeatitems
+    repeatItems = this.querySelectorAll(':scope > fx-repeatitem');
+    repeatItemCount = repeatItems.length;
+
     for (let position = 0; position < repeatItemCount; position += 1) {
       const item = repeatItems[position];
       this.getOwnerForm().registerLazyElement(item);
 
       if (item.nodeset !== this.nodeset[position]) {
         item.nodeset = this.nodeset[position];
+        if (this.getOwnerForm().createNodes) {
+          this.getOwnerForm().initData(item);
+        }
       }
     }
 
-    // Fore.refreshChildren(clone,true);
     const fore = this.getOwnerForm();
-    // if (!fore.lazyRefresh || force) {
     if (!fore.lazyRefresh || force) {
-      // Turn the possibly conditional force refresh into a forced one: we changed our children
       Fore.refreshChildren(this, force);
     }
-    // this.style.display = 'block';
-    // this.style.display = this.display;
+
     this.setIndex(this.index);
-    // console.timeEnd('repeat-refresh');
-
-    // this.replaceWith(clone);
-
-    // this.repeatCount = contextSize;
-    // console.log('repeatCount', this.repeatCount);
-  }
-
-  // eslint-disable-next-line class-methods-use-this
-  _fadeOut(el) {
-    el.style.opacity = 1;
-
-    (function fade() {
-      // eslint-disable-next-line no-cond-assign
-      if ((el.style.opacity -= 0.1) < 0) {
-        el.style.display = 'none';
-      } else {
-        requestAnimationFrame(fade);
-      }
-    })();
-  }
-
-  // eslint-disable-next-line class-methods-use-this
-  _fadeIn(el) {
-    if (!el) return;
-
-    el.style.opacity = 0;
-    el.style.display = this.display;
-
-    (function fade() {
-      // setTimeout(() => {
-      let val = parseFloat(el.style.opacity);
-      // eslint-disable-next-line no-cond-assign
-      if (!((val += 0.1) > 1)) {
-        el.style.opacity = val;
-        requestAnimationFrame(fade);
-      }
-      // }, 40);
-    })();
   }
 
   _initTemplate() {
-    this.template = this.querySelector('template');
-    // console.log('### init template for repeat ', this.id, this.template);
-    // todo: this.dropTarget not needed?
-    this.dropTarget = this.template.getAttribute('drop-target');
-    this.isDraggable = this.template.hasAttribute('draggable')
-      ? this.template.getAttribute('draggable')
-      : null;
+    // Template can be missing during early init (slot timing / nested repeats).
+    // Never dereference it before we have it.
+    if (!this.template) {
+      // Prefer a direct child template, then any descendant template.
+      this.template =
+        Array.from(this.children).find(c => c && c.localName === 'template') ||
+        this.querySelector('template') ||
+        (this.shadowRoot && this.shadowRoot.querySelector('template')) ||
+        null;
+    }
 
     if (this.template === null) {
-      // todo: catch this on form element
       this.dispatchEvent(
         new CustomEvent('no-template-error', {
           composed: true,
@@ -417,53 +958,60 @@ export class FxRepeat extends withDraggability(UIElement, false) {
           detail: { message: `no template found for repeat:${this.id}` },
         }),
       );
+      return;
     }
 
-    this.shadowRoot.appendChild(this.template);
+    this.dropTarget = this.template.getAttribute('drop-target');
+    this.isDraggable = this.template.hasAttribute('draggable')
+      ? this.template.getAttribute('draggable')
+      : null;
+
+    // Move template to shadow for safe reuse.
+    // If it's already in the shadowRoot, don't append again.
+    if (this.template.parentNode !== this.shadowRoot) {
+      this.shadowRoot.appendChild(this.template);
+    }
   }
 
   _initRepeatItems() {
     this.nodeset.forEach((item, index) => {
       const repeatItem = this._createNewRepeatItem();
       repeatItem.nodeset = this.nodeset[index];
-      repeatItem.index = index + 1; // 1-based index
+      repeatItem.index = index + 1;
 
       this.appendChild(repeatItem);
 
       if (this.getOwnerForm().createNodes) {
         this.getOwnerForm().initData(repeatItem);
-        const repeatItemClone = repeatItem.nodeset.cloneNode(true);
-        this.clearTextValues(repeatItemClone);
-
-        // this.createdNodeset = repeatItem.nodeset.cloneNode(true);
-        this.createdNodeset = repeatItemClone;
-        // console.log('createdNodeset', this.createdNodeset)
+        if (repeatItem.nodeset.nodeType) {
+          const repeatItemClone = repeatItem.nodeset.cloneNode(true);
+          this.clearTextValues(repeatItemClone);
+          this.createdNodeset = repeatItemClone;
+        }
       }
 
       if (repeatItem.index === 1) {
         this.applyIndex(repeatItem);
       }
-      // console.log('*********repeat item created', repeatItem.nodeset);
+
       Fore.dispatch(this, 'item-created', { nodeset: repeatItem.nodeset, pos: index + 1 });
       this._initVariables(repeatItem);
     });
   }
+
   clearTextValues(node) {
     if (!node) return;
 
-    // Clear text node content
     if (node.nodeType === Node.TEXT_NODE) {
       node.nodeValue = '';
     }
 
-    // Clear all attribute values
     if (node.nodeType === Node.ELEMENT_NODE) {
       for (const attr of Array.from(node.attributes)) {
-        attr.value = ''; // Clear attribute value
+        attr.value = '';
       }
     }
 
-    // Recursively clear child nodes
     for (const child of node.childNodes) {
       this.clearTextValues(child);
     }
@@ -483,9 +1031,17 @@ export class FxRepeat extends withDraggability(UIElement, false) {
   }
 
   _clone() {
-    // const content = this.template.content.cloneNode(true);
-    this.template = this.shadowRoot.querySelector('template');
-    const content = this.template.content.cloneNode(true);
+    const tpl =
+        this.template ||
+        (this.shadowRoot && this.shadowRoot.querySelector('template')) ||
+        this.querySelector('template');
+
+    if (!tpl) {
+      console.error(`[fx-repeat] ${this.id || ''}: no <template> found when cloning`);
+      return document.createDocumentFragment();
+    }
+
+    const content = tpl.content.cloneNode(true);
     return document.importNode(content, true);
   }
 
@@ -496,8 +1052,6 @@ export class FxRepeat extends withDraggability(UIElement, false) {
   }
 
   setInScopeVariables(inScopeVariables) {
-    // Repeats are interesting: the variables should be scoped per repeat item, they should not be
-    // able to see the variables in adjacent repeat items!
     this.inScopeVariables = new Map(inScopeVariables);
   }
 }
