@@ -570,11 +570,7 @@ export class FxSubmission extends ForeElementMixin {
       const binData = [...utf8Data].map(byte => String.fromCodePoint(byte)).join("");
       const base64Data = btoa(binData);
       downloadLink.setAttribute('download', target);
-<<<<<<< HEAD
-      downloadLink.setAttribute('href', `data:${contentType};base64,${base64Data}`);
-=======
       downloadLink.setAttribute('href', `data:${contentType},${encodeURIComponent(data)}`);
->>>>>>> upstream/dev
       document.body.appendChild(downloadLink);
       downloadLink.click();
       return;
